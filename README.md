@@ -110,21 +110,26 @@ bash "$HOME/Library/Mobile Documents/com~apple~CloudDocs/VibeSessionHub/install-
 ```text
 vibe-session-hub/
 ├── hub/
-│   ├── collectors.py       # 各 AI 客户端本地会话只读采集器（SQLite / JSONL / LevelDB 缓存）
-│   ├── config.py           # 端口、机器硬件指纹、iCloud 路径与主题偏好管理
+│   ├── collectors/         # 模块化只读采集器插件包（base / claude / codex / cursor / gemini / grok_bot / antigravity）
+│   ├── config.py           # 端口、HubPaths 依赖注入容器、机器硬件指纹、日志与主题偏好管理
+│   ├── tool_registry.py    # 全栈工具元数据单一事实源（标签、图标、Bundle ID、深链协议、手动登记选项）
+│   ├── sync_mirror.py      # 跨进程 flock 锁、内容哈希原子写入与单向所有权 iCloud 分片镜像
+│   ├── shard_ingestor.py   # JSONL 分片解析、手动 PR 链接合并与按行 SHA-256 增量入库引擎
+│   ├── search_engine.py    # SQLite FTS5 trigram 全文检索、PR singleflight 反查与 Facets 聚合
+│   ├── storage.py          # WAL 数据库连接/Schema 管理与存储协调门面（SessionHubStore）
 │   ├── git_pr_resolver.py  # 本地 git log 提交历史与 gh CLI 远端 PR 分支反查器
-│   ├── launcher.py         # 各客户端原生 Deep-Link 构造与安全唤起逻辑
-│   ├── server.py           # 本地 HTTP API、静态资源服务与后台定时增量同步守护线程
-│   └── storage.py          # SQLite FTS5 全文检索引擎与多机 JSONL 分片合并存储
+│   ├── launcher.py         # 基于工具注册表与策略分发表的原生 Deep-Link 安全唤起逻辑
+│   └── server.py           # 本地 HTTP API、静态 ES 模块服务与后台定时增量同步守护线程
 ├── macos/
-│   ├── VibeSessionHub.swift   # 原生 macOS AppKit + WKWebView 桌面窗口容器
+│   ├── VibeSessionHub.swift   # 原生 macOS AppKit + WKWebView 桌面窗口容器与 iCloud 桥接
 │   ├── build_icon.swift       # 自动生成全尺寸 macOS AppIcon.icns 与高清图标
 │   └── send_url_to_pid.swift  # 按指定进程 PID 精准投递 AppleEvent GURL 深链
 ├── static/
 │   ├── index.html          # 搜索工作台与主题/PR 绑定交互界面
 │   ├── styles.css          # 星环极光默认暗黑配色及全部 9 套主题样式表
-│   ├── app.js              # 前端检索状态、快捷键、高亮渲染与跨机交互逻辑
+│   ├── js/                 # 原生无构建 ES 模块（state / api / utils / theme / render / main）
 │   └── icons/              # 官方应用 Logo 与各 Agent 工具高清图标
+├── tests/                  # P0 性能/一致性测试与 P1 架构/DI/模块化测试套件
 └── install.sh              # 一键编译打包、LaunchAgent 注册与 iCloud 同步配置脚本
 ```
 

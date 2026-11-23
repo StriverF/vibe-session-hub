@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger("vibe_session_hub.git_pr_resolver")
 
 PR_QUERY_RE = re.compile(
     r"^(?:pr\s*#?|pull/|#)?(\d{2,7})$|"
@@ -100,7 +103,8 @@ def resolve_pr_from_local_git(
                 "source": "git_log",
                 "resolved_at": int(time.time() * 1000),
             }
-        except Exception:
+        except Exception as exc:
+            logger.debug("git log PR lookup failed in %s: %s", p, exc)
             continue
     return None
 
@@ -150,5 +154,6 @@ def resolve_pr_via_gh(
             "source": "gh_cli",
             "resolved_at": int(time.time() * 1000),
         }
-    except Exception:
+    except Exception as exc:
+        logger.debug("gh pr view #%s failed: %s", pr_number, exc)
         return None
