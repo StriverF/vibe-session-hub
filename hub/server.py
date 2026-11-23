@@ -69,26 +69,28 @@ def _render_jump_html(
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Vibe Session Hub · 会话跳转确认</title>
+  <link rel="icon" type="image/png" href="/icons/logo.png" />
   <style>
     body {{
       margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-      background: #111113; color: #f4f3ef; display: grid; place-items: center; min-height: 100vh;
+      background: #0b0c10; color: #f3f4f8; display: grid; place-items: center; min-height: 100vh;
     }}
     .card {{
-      max-width: 520px; width: calc(100% - 40px); background: #19191c;
-      border: 1px solid #2b2b30; border-radius: 16px; padding: 28px;
-      box-shadow: 0 20px 50px rgba(0,0,0,0.45);
+      max-width: 520px; width: calc(100% - 40px); background: #12131a;
+      border: 1px solid #252838; border-radius: 16px; padding: 28px;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.48);
     }}
     .dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: {badge_color}; margin-right: 8px; }}
-    .status {{ font-size: 13px; color: #a1a1aa; display: flex; align-items: center; margin-bottom: 12px; }}
+    .status {{ font-size: 13px; color: #a5a8b8; display: flex; align-items: center; margin-bottom: 12px; }}
     h1 {{ font-size: 18px; margin: 0 0 8px; line-height: 1.4; }}
-    p {{ font-size: 14px; color: #a1a1aa; margin: 0 0 20px; word-break: break-all; }}
+    p {{ font-size: 14px; color: #a5a8b8; margin: 0 0 20px; word-break: break-all; }}
     .actions {{ display: flex; gap: 10px; flex-wrap: wrap; }}
     .btn {{
       text-decoration: none; font-size: 13px; font-weight: 500; padding: 9px 15px;
-      border-radius: 9px; background: #d97757; color: #fff; border: none; cursor: pointer;
+      border-radius: 9px; background: linear-gradient(135deg, #5668f8 0%, #8b5cf6 52%, #d946ef 100%);
+      color: #fff; border: none; cursor: pointer; box-shadow: 0 3px 14px rgba(139, 92, 246, 0.28);
     }}
-    .btn.secondary {{ background: #26262b; color: #e4e4e7; }}
+    .btn.secondary {{ background: #1a1c26; color: #e4e4e7; border: 1px solid #252838; box-shadow: none; }}
   </style>
 </head>
 <body>

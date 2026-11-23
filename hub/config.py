@@ -31,6 +31,7 @@ MACHINE_FILE = LOCAL_STATE_DIR / "machine.json"
 PREFERENCES_FILE = LOCAL_STATE_DIR / "preferences.json"
 
 VALID_THEMES = {
+    "prism-aurora",
     "obsidian-amber",
     "graphite-mono",
     "forest-sage",
@@ -41,7 +42,7 @@ VALID_THEMES = {
     "mist-sage",
 }
 DEFAULT_PREFERENCES = {
-    "theme": "obsidian-amber",
+    "theme": "prism-aurora",
 }
 
 
