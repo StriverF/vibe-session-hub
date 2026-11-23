@@ -13,6 +13,17 @@ const TOOL_ICON_MAP = {
 
 const THEME_OPTIONS = [
   {
+    id: "prism-aurora",
+    name: "星环极光 · 默认",
+    desc: "Logo 光谱暗黑 · 极光流彩",
+    bg: "#0b0c10",
+    surface: "#12131a",
+    text: "#f3f4f8",
+    muted: "#6f7387",
+    accent: "#8b5cf6",
+    pill: "linear-gradient(135deg, #38bdf8 0%, #8b5cf6 44%, #ec4899 74%, #fb923c 100%)",
+  },
+  {
     id: "obsidian-amber",
     name: "曜石暖金",
     desc: "沉稳黑曜 · 暖陶主色",
@@ -104,7 +115,7 @@ const state = {
   resolvedPr: null,
   selectedIndex: 0,
   searchTimer: null,
-  theme: document.documentElement.dataset.theme || "obsidian-amber",
+  theme: document.documentElement.dataset.theme || "prism-aurora",
 };
 
 const els = {
@@ -257,7 +268,7 @@ function renderAppearanceOptions() {
               <span style="background:${t.text};width:85%"></span>
               <span style="background:${t.muted};width:60%"></span>
             </div>
-            <span class="theme-preview-pill" style="background:${t.accent}"></span>
+            <span class="theme-preview-pill" style="background:${t.pill || t.accent}"></span>
           </div>
           <div class="theme-opt-name">${escapeHtml(t.name)}</div>
           <div class="theme-opt-desc">${escapeHtml(t.desc)}</div>
