@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test-linux:
+    name: Linux Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Byte-compile Python modules
+        run: python -m py_compile hub/*.py hub/collectors/*.py scripts/*.py tests/*.py
+
+      - name: Run zero-dependency unittest suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Syntax-check frontend ES modules
+        run: |
+          for f in static/js/*.js; do
+            node --check "$f"
+          done
+
+      - name: Syntax-check shell scripts
+        run: bash -n install.sh scripts/package_macos.sh
+
+  test-and-build-macos:
+    name: macOS System Python & Universal App Build
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify macOS system Python 3 & SQLite FTS5
+        run: |
+          /usr/bin/python3 --version
+          /usr/bin/python3 -m py_compile hub/*.py hub/collectors/*.py scripts/*.py tests/*.py
+          /usr/bin/python3 -m unittest discover -s tests -v
+
+      - name: Syntax-check frontend ES modules & shell scripts
+        run: |
+          for f in static/js/*.js; do
+            node --check "$f"
+          done
+          bash -n install.sh scripts/package_macos.sh
+
+      - name: Build standalone universal Vibe Session Hub.app
+        run: bash scripts/package_macos.sh --arch universal --app-only --output-dir dist
+
+      - name: Verify universal Mach-O binaries and ad-hoc signature
+        run: |
+          APP="dist/Vibe Session Hub.app"
+          lipo -info "$APP/Contents/MacOS/VibeSessionHub" | tee /dev/stderr | grep -q "arm64"
+          lipo -info "$APP/Contents/MacOS/VibeSessionHub" | grep -q "x86_64"
+          lipo -info "$APP/Contents/MacOS/send_url_to_pid" | tee /dev/stderr | grep -q "arm64"
+          lipo -info "$APP/Contents/MacOS/send_url_to_pid" | grep -q "x86_64"
+          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/send_url_to_pid"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
+          codesign -d --entitlements :- "$APP/Contents/MacOS/send_url_to_pid" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
+          /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$APP/Contents/Info.plist" >/dev/null
+
+      - name: Smoke-test bundled runtime on custom port
+        run: |
+          APP_ROOT="dist/Vibe Session Hub.app/Contents/Resources/app"
+          TMP_STATE="$(mktemp -d)"
+          SRV_PID=""
+          cleanup() {
+            if [ -n "$SRV_PID" ]; then
+              kill "$SRV_PID" 2>/dev/null || true
+            fi
+            rm -rf "$TMP_STATE"
+          }
+          trap cleanup EXIT
+
+          (
+            cd "$APP_ROOT"
+            VIBE_HUB_STATE_DIR="$TMP_STATE" VIBE_HUB_LOCAL_ONLY=1 \
+              /usr/bin/python3 -B -m hub.server --port 18399 --local-only
+          ) > "$TMP_STATE/srv.log" 2>&1 &
+          SRV_PID=$!
+
+          for i in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:18399/api/health >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.25
+          done
+
+          curl -fsS http://127.0.0.1:18399/api/health | /usr/bin/python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)
+          assert d["ok"] is True, d
+          assert d["port"] == 18399, d
+          assert d["server"]["base_url"] == "http://127.0.0.1:18399", d
+          print("Health OK:", d["version"], d["server"]["base_url"])
+          '
+          curl -fsSI http://127.0.0.1:18399/js/main.js | grep -qi "200 OK"
+          STATUS="$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:18399/..%2fhub/server.py')"
+          test "$STATUS" = "404"

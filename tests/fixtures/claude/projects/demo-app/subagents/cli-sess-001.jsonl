@@ -1,0 +1,1 @@
+{"type":"user","gitBranch":"should-ignore-subagent","message":{"content":"Subagent trace should never be indexed as top-level session"}}

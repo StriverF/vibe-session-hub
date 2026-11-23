@@ -1,0 +1,14 @@
+{
+  "sessionId": "local_claude_002",
+  "cliSessionId": "missing-cli-id",
+  "title": "",
+  "createdAt": 1760515200,
+  "lastTurnEdgeAt": 1760518800,
+  "gitAnchors": [
+    {
+      "gitRoot": "/Users/dev/workspace/infra-tools"
+    }
+  ],
+  "lastTurnReport": "Verified Terraform module outputs and rotated staging webhook secret.",
+  "isArchived": true
+}

@@ -36,13 +36,15 @@ def _clean_cursor_user_text(text: str) -> str:
     return clean_text(text)
 
 
-def _decode_cursor_project_slug_cwd(slug: str) -> str:
+def _decode_cursor_project_slug_cwd(slug: str, users_root: Path | None = None) -> str:
     if not slug or not slug.startswith("Users-"):
         return ""
     parts = slug.split("-")
     if len(parts) < 2 or parts[0] != "Users":
         return ""
-    user_home = f"/Users/{parts[1]}"
+    user_home = (
+        str(users_root / parts[1]) if users_root is not None else f"/Users/{parts[1]}"
+    )
     if not os.path.isdir(user_home):
         return ""
     rem_parts = parts[2:]
@@ -133,8 +135,9 @@ def _new_cursor_record() -> dict[str, Any]:
 
 def _scan_workspace_storage(
     records: dict[str, dict[str, Any]],
+    ws_root: Path | None = None,
 ) -> None:
-    ws_root = Path(
+    ws_root = ws_root or Path(
         os.path.expanduser("~/Library/Application Support/Cursor/User/workspaceStorage")
     )
     if not ws_root.is_dir():
@@ -195,8 +198,9 @@ def _scan_global_storage(
     header_ids: set[str],
     subagent_parent: dict[str, str],
     empty_draft_ids: set[str],
+    gs_db: Path | None = None,
 ) -> bool:
-    gs_db = Path(
+    gs_db = gs_db or Path(
         os.path.expanduser(
             "~/Library/Application Support/Cursor/User/globalStorage/state.vscdb"
         )
@@ -286,8 +290,11 @@ def _scan_global_storage(
     return has_composer_headers_table
 
 
-def _scan_conversation_search_db(records: dict[str, dict[str, Any]]) -> None:
-    cs_db = Path(
+def _scan_conversation_search_db(
+    records: dict[str, dict[str, Any]],
+    cs_db: Path | None = None,
+) -> None:
+    cs_db = cs_db or Path(
         os.path.expanduser(
             "~/Library/Application Support/Cursor/User/globalStorage/conversation-search.db"
         )
@@ -349,9 +356,12 @@ def _scan_conversation_search_db(records: dict[str, dict[str, Any]]) -> None:
 
 
 def _scan_agent_transcripts(
-    records: dict[str, dict[str, Any]], cache: FileParseCache
+    records: dict[str, dict[str, Any]],
+    cache: FileParseCache,
+    projects_root: Path | None = None,
+    users_root: Path | None = None,
 ) -> None:
-    cp_root = Path(os.path.expanduser("~/.cursor/projects"))
+    cp_root = projects_root or Path(os.path.expanduser("~/.cursor/projects"))
     if not cp_root.is_dir():
         return
 
@@ -361,7 +371,9 @@ def _scan_agent_transcripts(
         at_dir = proj_dir / "agent-transcripts"
         if not at_dir.is_dir():
             continue
-        inferred_cwd = _decode_cursor_project_slug_cwd(proj_dir.name)
+        inferred_cwd = _decode_cursor_project_slug_cwd(
+            proj_dir.name, users_root=users_root
+        )
         for jp in at_dir.rglob("*.jsonl"):
             if "subagents" in jp.parts:
                 continue
@@ -455,19 +467,29 @@ def _fold_subagents(
 
 
 def collect_cursor_sessions(
-    machine_id: str, machine_name: str, cache: FileParseCache
+    machine_id: str,
+    machine_name: str,
+    cache: FileParseCache,
+    *,
+    ws_root: Path | None = None,
+    gs_db: Path | None = None,
+    cs_db: Path | None = None,
+    projects_root: Path | None = None,
+    users_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     header_ids: set[str] = set()
     subagent_parent: dict[str, str] = {}
     empty_draft_ids: set[str] = set()
 
-    _scan_workspace_storage(records)
+    _scan_workspace_storage(records, ws_root=ws_root)
     has_composer_headers_table = _scan_global_storage(
-        records, header_ids, subagent_parent, empty_draft_ids
+        records, header_ids, subagent_parent, empty_draft_ids, gs_db=gs_db
     )
-    _scan_conversation_search_db(records)
-    _scan_agent_transcripts(records, cache)
+    _scan_conversation_search_db(records, cs_db=cs_db)
+    _scan_agent_transcripts(
+        records, cache, projects_root=projects_root, users_root=users_root
+    )
     _fold_subagents(records, subagent_parent)
 
     results: list[dict[str, Any]] = []

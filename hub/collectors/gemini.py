@@ -27,10 +27,13 @@ logger = logging.getLogger("vibe_session_hub.collectors.gemini")
 
 
 def _collect_gemini_desktop(
-    machine_id: str, machine_name: str, seen_ids: set[str]
+    machine_id: str,
+    machine_name: str,
+    seen_ids: set[str],
+    cache_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    gem_cache_root = Path(
+    gem_cache_root = cache_root or Path(
         os.path.expanduser("~/Library/Caches/com.google.GeminiMacOS/Gemini")
     )
     if not gem_cache_root.is_dir():
@@ -143,9 +146,10 @@ def _collect_gemini_cli(
     machine_name: str,
     cache: FileParseCache,
     seen_ids: set[str],
+    cli_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    gem_dot = Path(os.path.expanduser("~/.gemini"))
+    gem_dot = cli_root or Path(os.path.expanduser("~/.gemini"))
     if not gem_dot.is_dir():
         return results
 
@@ -230,9 +234,20 @@ def _collect_gemini_cli(
 
 
 def collect_gemini_sessions(
-    machine_id: str, machine_name: str, cache: FileParseCache
+    machine_id: str,
+    machine_name: str,
+    cache: FileParseCache,
+    *,
+    desktop_cache_root: Path | None = None,
+    cli_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     seen_ids: set[str] = set()
-    results = _collect_gemini_desktop(machine_id, machine_name, seen_ids)
-    results.extend(_collect_gemini_cli(machine_id, machine_name, cache, seen_ids))
+    results = _collect_gemini_desktop(
+        machine_id, machine_name, seen_ids, cache_root=desktop_cache_root
+    )
+    results.extend(
+        _collect_gemini_cli(
+            machine_id, machine_name, cache, seen_ids, cli_root=cli_root
+        )
+    )
     return results

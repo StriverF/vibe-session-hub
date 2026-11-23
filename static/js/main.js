@@ -27,6 +27,9 @@ import { buildCrossMacJumpUrl, showToast } from "./utils.js";
 async function loadFacets() {
   const data = await fetchFacets();
   state.facets = data;
+  if (data.server?.base_url) {
+    state.serverBaseUrl = data.server.base_url;
+  }
   if (data.tool_catalog) {
     updateToolCatalog(data.tool_catalog);
     renderManualLinkToolOptions();

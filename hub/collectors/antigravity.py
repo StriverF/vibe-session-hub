@@ -6,7 +6,7 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from .base import (
     MAX_SEARCH_TEXT_CHARS,
@@ -39,12 +39,19 @@ def _extract_primary_workspace(workspace_uris_raw: str) -> str:
 
 
 def collect_antigravity_sessions(
-    machine_id: str, machine_name: str, cache: FileParseCache
+    machine_id: str,
+    machine_name: str,
+    cache: FileParseCache,
+    *,
+    db_paths: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
-    db_paths = [
-        Path(os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")),
-        Path(os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")),
-    ]
+    if db_paths is None:
+        db_paths = [
+            Path(os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")),
+            Path(
+                os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+            ),
+        ]
     seen_ids: set[str] = set()
     results: list[dict[str, Any]] = []
 
@@ -53,7 +60,7 @@ def collect_antigravity_sessions(
             continue
         con: sqlite3.Connection | None = None
         try:
-            con = sqlite3.connect(f"file:{db_path}?immutable=1", uri=True)
+            con = sqlite3.connect(f"file:{quote(str(db_path))}?immutable=1", uri=True)
             con.row_factory = sqlite3.Row
             rows = con.execute(
                 """

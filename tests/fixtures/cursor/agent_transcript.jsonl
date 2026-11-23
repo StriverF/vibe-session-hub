@@ -1,0 +1,2 @@
+{"role":"user","message":{"content":"<timestamp>2026-10-17T10:00:00Z</timestamp><user_query>Tune SQLite WAL busy_timeout for concurrent reads</user_query>"}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"Updated busy_timeout to 5000ms and referenced https://github.com/acme/demo-app/pull/3110."}]}}

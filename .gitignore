@@ -3,10 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# macOS & compiled binaries
+# macOS & compiled binaries / release artifacts
 .DS_Store
 macos/bin/
+dist/
 *.app/
+*.dmg
+*.dmg.sha256
 *.iconset/
 
 # Local IDE / agent configs

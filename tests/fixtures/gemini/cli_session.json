@@ -1,0 +1,16 @@
+{
+  "sessionId": "gemini-cli-001",
+  "cwd": "/Users/dev/workspace/demo-app",
+  "startTime": "2026-10-18T12:00:00Z",
+  "lastUpdated": "2026-10-18T12:25:00Z",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Review release workflow for https://github.com/acme/demo-app/pull/4120"
+    },
+    {
+      "role": "model",
+      "content": "Verified universal DMG signing and checksum generation steps."
+    }
+  ]
+}

@@ -128,8 +128,23 @@ export const state = {
   resolvedPr: null,
   selectedIndex: 0,
   searchTimer: null,
+  serverBaseUrl: "",
   theme: document.documentElement.dataset.theme || "prism-aurora",
 };
+
+export function getServerBaseUrl() {
+  if (state.serverBaseUrl) {
+    return state.serverBaseUrl.replace(/\/+$/, "");
+  }
+  if (
+    typeof window !== "undefined" &&
+    window.location?.origin &&
+    /^https?:\/\//i.test(window.location.origin)
+  ) {
+    return window.location.origin.replace(/\/+$/, "");
+  }
+  return "http://127.0.0.1:17380";
+}
 
 export function updateToolCatalog(catalog) {
   if (!catalog || typeof catalog !== "object") return;

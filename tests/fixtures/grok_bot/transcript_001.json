@@ -1,0 +1,24 @@
+{
+  "value": {
+    "entries": [
+      {
+        "kind": "send-message",
+        "timestampMs": 1760800100000,
+        "message": {
+          "content": "Check flock compatibility with Swift O_EXLOCK for https://github.com/acme/demo-app/pull/5011"
+        }
+      },
+      {
+        "kind": "message",
+        "role": "assistant",
+        "timestampMs": 1760800900000,
+        "content": [
+          {
+            "type": "text",
+            "text": "Confirmed BSD O_EXLOCK and fcntl.flock share kernel lock state on macOS."
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -4,13 +4,106 @@ import Darwin
 import Foundation
 import WebKit
 
+private let defaultHubPort = 17380
+private let launchAgentLabel = "com.vibesessionhub.app"
+
+private func parseValidPort(_ raw: Any?) -> Int? {
+    if let intVal = raw as? Int, (1...65535).contains(intVal) {
+        return intVal
+    }
+    if let numVal = raw as? NSNumber {
+        let intVal = numVal.intValue
+        if (1...65535).contains(intVal) {
+            return intVal
+        }
+    }
+    if let strVal = raw as? String {
+        let trimmed = strVal.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let intVal = Int(trimmed), (1...65535).contains(intVal) {
+            return intVal
+        }
+    }
+    return nil
+}
+
+private func resolveStateDir() -> URL {
+    let env = ProcessInfo.processInfo.environment
+    if let custom = env["VIBE_HUB_STATE_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !custom.isEmpty {
+        return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+    }
+    return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".vibe-session-hub")
+}
+
+private func resolveICloudSyncDir() -> URL {
+    let env = ProcessInfo.processInfo.environment
+    if let custom = env["VIBE_HUB_SYNC_DIR"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+       !custom.isEmpty {
+        return URL(fileURLWithPath: (custom as NSString).expandingTildeInPath)
+    }
+    return FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/VibeSessionHub")
+}
+
+private func resolveHubPort() -> Int {
+    // 1. CLI flag: --port <N> or --port=<N>
+    let args = CommandLine.arguments
+    for i in 0..<args.count {
+        if args[i] == "--port", i + 1 < args.count, let port = parseValidPort(args[i + 1]) {
+            return port
+        }
+        if args[i].hasPrefix("--port=") {
+            let val = String(args[i].dropFirst("--port=".count))
+            if let port = parseValidPort(val) {
+                return port
+            }
+        }
+    }
+
+    // 2. Environment variable: VIBE_HUB_PORT
+    if let envPort = parseValidPort(ProcessInfo.processInfo.environment["VIBE_HUB_PORT"]) {
+        return envPort
+    }
+
+    // 3. User preferences file: ~/.vibe-session-hub/preferences.json -> "port"
+    let prefsURL = resolveStateDir().appendingPathComponent("preferences.json")
+    if let data = try? Data(contentsOf: prefsURL),
+       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+       let prefPort = parseValidPort(json["port"]) {
+        return prefPort
+    }
+
+    // 4. Info.plist default override: VibeHubPort
+    if let plistPort = parseValidPort(Bundle.main.object(forInfoDictionaryKey: "VibeHubPort")) {
+        return plistPort
+    }
+
+    return defaultHubPort
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate {
     var window: NSWindow!
     var webView: WKWebView!
     var backendProcess: Process?
     var syncTimer: Timer?
     private let syncQueue = DispatchQueue(label: "com.vibesessionhub.icloud-bridge", qos: .utility)
-    let hubURL = URL(string: "http://127.0.0.1:17380")!
+
+    let hubPort: Int
+    let hubURL: URL
+    let stateDir: URL
+    let icloudSyncDir: URL
+
+    override init() {
+        self.hubPort = resolveHubPort()
+        self.hubURL = URL(string: "http://127.0.0.1:\(self.hubPort)")!
+        self.stateDir = resolveStateDir()
+        self.icloudSyncDir = resolveICloudSyncDir()
+        super.init()
+    }
+
+    private func endpointURL(_ pathWithQuery: String) -> URL {
+        return URL(string: "http://127.0.0.1:\(hubPort)\(pathWithQuery)")!
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMainMenu()
@@ -37,10 +130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         guard let first = urls.first else { return }
         if first.scheme?.lowercased() == "vibehub" {
             let query = first.query ?? ""
-            if let target = URL(string: "http://127.0.0.1:17380/jump?\(query)") {
-                window.makeKeyAndOrderFront(nil)
-                webView.load(URLRequest(url: target))
-            }
+            let target = endpointURL("/jump?\(query)")
+            window.makeKeyAndOrderFront(nil)
+            webView.load(URLRequest(url: target))
         }
     }
 
@@ -52,11 +144,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     private func setupMainMenu() {
         let mainMenu = NSMenu()
+        let appVersion = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0.0"
 
         let appMenuItem = NSMenuItem()
         mainMenu.addItem(appMenuItem)
         let appMenu = NSMenu()
+        let versionItem = NSMenuItem(
+            title: "Vibe Session Hub v\(appVersion) (127.0.0.1:\(hubPort))",
+            action: nil,
+            keyEquivalent: ""
+        )
+        versionItem.isEnabled = false
+        appMenu.addItem(versionItem)
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "重新加载", action: #selector(reloadPage), keyEquivalent: "r")
+        appMenu.addItem(withTitle: "在浏览器中打开", action: #selector(openInBrowser), keyEquivalent: "b")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "安装 / 更新开机后台服务", action: #selector(installLaunchAgentMenuAction), keyEquivalent: "")
+        appMenu.addItem(withTitle: "卸载开机后台服务", action: #selector(uninstallLaunchAgentMenuAction), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "隐藏 Vibe Session Hub", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(withTitle: "关闭窗口", action: #selector(closeCurrentWindow), keyEquivalent: "w")
@@ -83,8 +188,146 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         webView.load(URLRequest(url: hubURL))
     }
 
+    @objc private func openInBrowser() {
+        NSWorkspace.shared.open(hubURL)
+    }
+
     @objc private func closeCurrentWindow() {
         window.orderOut(nil)
+    }
+
+    private func showInfoAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    private func resolveBackendRoot() -> URL? {
+        let fm = FileManager.default
+        guard let resURL = Bundle.main.resourceURL else { return nil }
+
+        // 1. Dev checkout mode (written by install.sh): prefer local repo when present
+        let rootPointer = resURL.appendingPathComponent("project_root.txt")
+        if let projectRoot = try? String(contentsOf: rootPointer, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !projectRoot.isEmpty {
+            let devURL = URL(fileURLWithPath: projectRoot)
+            if fm.fileExists(atPath: devURL.appendingPathComponent("hub/server.py").path) {
+                return devURL
+            }
+        }
+
+        // 2. Standalone release bundle mode (DMG / Applications): embedded runtime inside .app
+        let bundledAppURL = resURL.appendingPathComponent("app")
+        if fm.fileExists(atPath: bundledAppURL.appendingPathComponent("hub/server.py").path) {
+            return bundledAppURL
+        }
+
+        return nil
+    }
+
+    private func resolveSendURLHelperPath() -> String? {
+        let candidate = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/send_url_to_pid")
+        return FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate.path : nil
+    }
+
+    @objc private func installLaunchAgentMenuAction() {
+        guard let backendRoot = resolveBackendRoot() else {
+            showInfoAlert(title: "无法定位内置服务目录", message: "请重新从 DMG 安装 Vibe Session Hub.app。")
+            return
+        }
+        let fm = FileManager.default
+        let home = fm.homeDirectoryForCurrentUser
+        let agentsDir = home.appendingPathComponent("Library/LaunchAgents")
+        let plistURL = agentsDir.appendingPathComponent("\(launchAgentLabel).plist")
+        try? fm.createDirectory(at: agentsDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: stateDir, withIntermediateDirectories: true)
+
+        var envVars: [String: String] = [
+            "VIBE_HUB_PORT": String(hubPort),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        ]
+        if let helperPath = resolveSendURLHelperPath() {
+            envVars["VIBE_HUB_SEND_URL_BIN"] = helperPath
+        }
+
+        let plistDict: [String: Any] = [
+            "Label": launchAgentLabel,
+            "ProgramArguments": [
+                "/usr/bin/python3",
+                "-B",
+                "-m",
+                "hub.server",
+                "--port",
+                String(hubPort),
+            ],
+            "WorkingDirectory": backendRoot.path,
+            "EnvironmentVariables": envVars,
+            "RunAtLoad": true,
+            "KeepAlive": true,
+            "StandardOutPath": stateDir.appendingPathComponent("server.log").path,
+            "StandardErrorPath": stateDir.appendingPathComponent("server.err.log").path,
+        ]
+
+        do {
+            let plistData = try PropertyListSerialization.data(fromPropertyList: plistDict, format: .xml, options: 0)
+            try plistData.write(to: plistURL, options: .atomic)
+
+            // Stop any local fallback backend spawned by this app so LaunchAgent owns the port cleanly
+            if let proc = backendProcess, proc.isRunning {
+                proc.terminate()
+                backendProcess = nil
+            }
+
+            let uid = String(getuid())
+            let bootout = Process()
+            bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            bootout.arguments = ["bootout", "gui/\(uid)", plistURL.path]
+            try? bootout.run()
+            bootout.waitUntilExit()
+
+            let bootstrap = Process()
+            bootstrap.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+            bootstrap.arguments = ["bootstrap", "gui/\(uid)", plistURL.path]
+            try bootstrap.run()
+            bootstrap.waitUntilExit()
+
+            if bootstrap.terminationStatus == 0 {
+                showInfoAlert(
+                    title: "已启用开机后台服务",
+                    message: "后台服务将随系统启动并监听 http://127.0.0.1:\(hubPort)，即使关闭主窗口也能随时响应跨机跳转链接与定时增量同步。"
+                )
+                pollUntilReady(attemptsLeft: 20)
+            } else {
+                showInfoAlert(
+                    title: "注册后台服务失败",
+                    message: "launchctl 返回状态码 \(bootstrap.terminationStatus)，应用将继续使用内置后台服务运行。"
+                )
+            }
+        } catch {
+            showInfoAlert(title: "写入 LaunchAgent 失败", message: error.localizedDescription)
+        }
+    }
+
+    @objc private func uninstallLaunchAgentMenuAction() {
+        let fm = FileManager.default
+        let plistURL = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist")
+        let uid = String(getuid())
+
+        let bootout = Process()
+        bootout.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        bootout.arguments = ["bootout", "gui/\(uid)", plistURL.path]
+        try? bootout.run()
+        bootout.waitUntilExit()
+
+        try? fm.removeItem(at: plistURL)
+        showInfoAlert(
+            title: "已卸载开机后台服务",
+            message: "已移除 \(plistURL.lastPathComponent)。重新打开应用时仍会自动启动内置本地服务。"
+        )
     }
 
     private func setupWindow() {
@@ -128,12 +371,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 return
             }
             self.spawnFallbackBackend()
-            self.pollUntilReady(attemptsLeft: 25)
+            self.pollUntilReady(attemptsLeft: 30)
         }
     }
 
     private func fetchSyncHealth(completion: @escaping ([String: Any]?) -> Void) {
-        var req = URLRequest(url: URL(string: "http://127.0.0.1:17380/api/health")!)
+        var req = URLRequest(url: endpointURL("/api/health"))
         req.timeoutInterval = 1.2
         URLSession.shared.dataTask(with: req) { data, resp, _ in
             guard let httpResp = resp as? HTTPURLResponse,
@@ -148,7 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     private func checkHealth(completion: @escaping (Bool) -> Void) {
-        var req = URLRequest(url: URL(string: "http://127.0.0.1:17380/api/health")!)
+        var req = URLRequest(url: endpointURL("/api/health"))
         req.timeoutInterval = 0.6
         URLSession.shared.dataTask(with: req) { _, resp, _ in
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
@@ -157,15 +400,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     private func spawnFallbackBackend() {
-        guard let resPath = Bundle.main.resourcePath else { return }
-        let rootPointer = URL(fileURLWithPath: resPath).appendingPathComponent("project_root.txt")
-        guard let projectRoot = try? String(contentsOf: rootPointer, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-              !projectRoot.isEmpty else { return }
+        guard let backendRoot = resolveBackendRoot() else { return }
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        proc.arguments = ["-m", "hub.server"]
-        proc.currentDirectoryURL = URL(fileURLWithPath: projectRoot)
+        proc.arguments = ["-B", "-m", "hub.server", "--port", String(hubPort)]
+        proc.currentDirectoryURL = backendRoot
+
+        var env = ProcessInfo.processInfo.environment
+        env["VIBE_HUB_PORT"] = String(hubPort)
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["PYTHONUNBUFFERED"] = "1"
+        if let helperPath = resolveSendURLHelperPath() {
+            env["VIBE_HUB_SEND_URL_BIN"] = helperPath
+        }
+        proc.environment = env
+
         try? proc.run()
         backendProcess = proc
     }
@@ -200,9 +450,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             self.syncQueue.async {
                 let fm = FileManager.default
                 let home = fm.homeDirectoryForCurrentUser
-                let localSync = home.appendingPathComponent(".vibe-session-hub/sync")
+                let localSync = self.stateDir.appendingPathComponent("sync")
                 let icloudRoot = home.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs")
-                let icloudBase = icloudRoot.appendingPathComponent("VibeSessionHub")
+                let icloudBase = self.icloudSyncDir
                 guard fm.fileExists(atPath: icloudRoot.path) else {
                     return
                 }
@@ -272,7 +522,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 }
 
                 if bridgeAccessible && (pulledRemoteChange || backendNeedsBridgeStatus) {
-                    var req = URLRequest(url: URL(string: "http://127.0.0.1:17380/api/sync")!)
+                    var req = URLRequest(url: self.endpointURL("/api/sync"))
                     req.httpMethod = "POST"
                     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                     req.setValue("1", forHTTPHeaderField: "X-Vibe-Hub")
@@ -322,16 +572,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
-        if let url = navigationAction.request.url,
-           let scheme = url.scheme?.lowercased(),
-           scheme != "http" && scheme != "https" && scheme != "about" {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+        let scheme = url.scheme?.lowercased() ?? ""
+        if scheme == "about" {
+            decisionHandler(.allow)
+            return
+        }
+        if scheme != "http" && scheme != "https" {
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
             return
         }
-        if let url = navigationAction.request.url,
-           let host = url.host?.lowercased(),
-           host != "127.0.0.1" && host != "localhost" {
+        let host = url.host?.lowercased() ?? ""
+        let port = url.port ?? (scheme == "https" ? 443 : 80)
+        if (host != "127.0.0.1" && host != "localhost") || port != hubPort {
             NSWorkspace.shared.open(url)
             decisionHandler(.cancel)
             return

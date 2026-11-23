@@ -13,14 +13,16 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+from . import __version__
 from .config import (
     DEFAULT_HOST,
     DEFAULT_PORT,
     configure_logging,
     get_machine_info,
     get_preferences,
+    resolve_configured_port,
     update_machine_name,
     update_preferences,
 )
@@ -36,6 +38,57 @@ from .tool_registry import export_client_tool_catalog
 logger = logging.getLogger("vibe_session_hub.server")
 
 STATIC_DIR = (Path(__file__).resolve().parent.parent / "static").resolve()
+
+
+def is_path_within(candidate: Path, base_dir: Path) -> bool:
+    """Safely verify that `candidate` resolves strictly inside `base_dir`."""
+    try:
+        resolved_base = base_dir.resolve()
+        resolved_candidate = candidate.resolve()
+    except (OSError, ValueError):
+        return False
+    if hasattr(resolved_candidate, "is_relative_to"):
+        return resolved_candidate.is_relative_to(resolved_base)
+    try:
+        resolved_candidate.relative_to(resolved_base)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_static_file(
+    request_path: str, static_dir: Path = STATIC_DIR
+) -> Path | None:
+    """Decode and validate a static asset request path against `static_dir`.
+
+    Prevents directory traversal (`../`, `%2e%2e%2f`), sibling prefix collisions
+    (`/static_secret`), NUL bytes, backslash tricks, and symlink escapes.
+    """
+    try:
+        decoded = unquote(request_path)
+    except Exception:
+        return None
+    if "\x00" in decoded or "\\" in decoded:
+        return None
+
+    if decoded in ("", "/"):
+        rel = "index.html"
+    else:
+        rel = decoded.lstrip("/")
+        if not rel or Path(rel).is_absolute():
+            return None
+
+    try:
+        base = static_dir.resolve()
+        candidate = (base / rel).resolve()
+    except (OSError, ValueError):
+        return None
+
+    if candidate == base or not is_path_within(candidate, base):
+        return None
+    if not candidate.is_file():
+        return None
+    return candidate
 
 
 def _render_jump_html(
@@ -181,28 +234,73 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             )
         return update_preferences(theme=theme)
 
+    def _get_server_info(self) -> dict[str, Any]:
+        addr = getattr(self.server, "server_address", (DEFAULT_HOST, DEFAULT_PORT))
+        host = str(addr[0] or DEFAULT_HOST) if isinstance(addr, tuple) and addr else DEFAULT_HOST
+        port = int(getattr(self.server, "server_port", DEFAULT_PORT) or DEFAULT_PORT)
+        return {
+            "host": host,
+            "port": port,
+            "base_url": f"http://{host}:{port}",
+            "version": __version__,
+        }
+
     def _verify_same_origin_post(self) -> bool:
         if self.headers.get("X-Vibe-Hub") != "1":
             return False
-        host = (self.headers.get("Host") or "").split(":")[0].lower()
-        if host not in ("127.0.0.1", "localhost"):
+
+        raw_host = (self.headers.get("Host") or "").strip()
+        if not raw_host:
             return False
-        origin = (self.headers.get("Origin") or "").lower()
-        if origin and not (
-            origin.startswith("http://127.0.0.1:")
-            or origin.startswith("http://localhost:")
+        try:
+            parsed_host = urlparse(f"http://{raw_host}")
+        except Exception:
+            return False
+        if (
+            parsed_host.hostname not in ("127.0.0.1", "localhost")
+            or parsed_host.username is not None
+            or parsed_host.password is not None
+            or parsed_host.path not in ("", "/")
         ):
             return False
+        server_port = int(getattr(self.server, "server_port", 0) or 0)
+        try:
+            host_port = parsed_host.port
+        except ValueError:
+            return False
+        if server_port and host_port is not None and host_port != server_port:
+            return False
+
+        raw_origin = (self.headers.get("Origin") or "").strip()
+        if raw_origin:
+            try:
+                parsed_origin = urlparse(raw_origin)
+                origin_port = parsed_origin.port
+            except Exception:
+                return False
+            if (
+                parsed_origin.scheme != "http"
+                or parsed_origin.hostname not in ("127.0.0.1", "localhost")
+                or parsed_origin.username is not None
+                or parsed_origin.password is not None
+                or parsed_origin.path not in ("", "/")
+                or parsed_origin.query
+                or parsed_origin.fragment
+            ):
+                return False
+            if server_port and (origin_port or 80) != server_port:
+                return False
         return True
 
-    def _send_json(self, payload: Any, status: int = 200) -> None:
+    def _send_json(self, payload: Any, status: int = 200, head_only: bool = False) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        if not head_only:
+            self.wfile.write(body)
 
     def _read_json_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or "0")
@@ -210,6 +308,30 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             return {}
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
+
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/api/health":
+            store = self._get_store()
+            health = store.get_sync_health()
+            server_info = self._get_server_info()
+            self._send_json(
+                {
+                    "ok": True,
+                    "version": __version__,
+                    "port": server_info["port"],
+                    "server": server_info,
+                    "machine": self._get_machine_info(),
+                    **health,
+                },
+                head_only=True,
+            )
+            return
+        if path.startswith("/api/"):
+            self.send_error(HTTPStatus.METHOD_NOT_ALLOWED, "Method Not Allowed")
+            return
+        self._serve_static(path, head_only=True)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -235,9 +357,13 @@ class HubRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/health":
             health = store.get_sync_health()
+            server_info = self._get_server_info()
             self._send_json(
                 {
                     "ok": True,
+                    "version": __version__,
+                    "port": server_info["port"],
+                    "server": server_info,
                     "machine": self._get_machine_info(),
                     **health,
                 }
@@ -252,6 +378,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             facets = store.get_facets()
             facets["preferences"] = self._get_preferences()
             facets["tool_catalog"] = export_client_tool_catalog()
+            facets["server"] = self._get_server_info()
             self._send_json(facets)
             return
 
@@ -316,10 +443,9 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _serve_static(self, path: str) -> None:
-        rel = "index.html" if path in ("/", "") else path.lstrip("/")
-        file_path = (STATIC_DIR / rel).resolve()
-        if not file_path.is_relative_to(STATIC_DIR) or not file_path.is_file():
+    def _serve_static(self, path: str, head_only: bool = False) -> None:
+        file_path = resolve_static_file(path, static_dir=STATIC_DIR)
+        if file_path is None:
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
             return
 
@@ -335,7 +461,8 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
-        self.wfile.write(data)
+        if not head_only:
+            self.wfile.write(data)
 
     def do_POST(self) -> None:
         if not self._verify_same_origin_post():
@@ -435,7 +562,7 @@ def _background_sync_loop(store: SessionHubStore, interval_sec: int = 90) -> Non
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Vibe Session Hub local server")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--open", dest="open_browser", action="store_true")
     parser.add_argument("--sync-once", dest="sync_only", action="store_true")
     parser.add_argument("--local-only", dest="local_only", action="store_true")
@@ -456,14 +583,18 @@ def main(argv: list[str] | None = None) -> None:
         store.close()
         return
 
+    listen_port = resolve_configured_port(
+        cli_port=args.port,
+        preferences_file=store.paths.preferences_file,
+    )
     HubRequestHandler.store = store
     bg = threading.Thread(target=_background_sync_loop, args=(store, 90), daemon=True)
     bg.start()
 
-    server = create_http_server(store, host=DEFAULT_HOST, port=args.port)
-    url = f"http://{DEFAULT_HOST}:{args.port}"
+    server = create_http_server(store, host=DEFAULT_HOST, port=listen_port)
+    url = f"http://{DEFAULT_HOST}:{server.server_port}"
     print(
-        f"Vibe Session Hub listening on {url} ({info['total_sessions']} sessions indexed)",
+        f"Vibe Session Hub v{__version__} listening on {url} ({info['total_sessions']} sessions indexed)",
         flush=True,
     )
     if args.open_browser:

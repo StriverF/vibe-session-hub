@@ -1,0 +1,31 @@
+{
+  "value": {
+    "rows": [
+      {
+        "id": "grok-agent-001",
+        "title": "Audit iCloud atomic mirror lock",
+        "description": "Fallback roster description",
+        "path": "/Users/dev/workspace/demo-app",
+        "createdAt": 1760800000000,
+        "lastActivityAt": 1760803600000,
+        "isHiddenFromSidebar": false,
+        "isRemovedFromSidebar": false
+      },
+      {
+        "id": "grok-agent-archived",
+        "name": "Archived telemetry cleanup",
+        "description": "Removed unused spans",
+        "path": "/tmp/non-users-path",
+        "createdAt": 1760790000000,
+        "updatedAt": 1760791000000,
+        "isHiddenFromSidebar": true,
+        "isRemovedFromSidebar": false
+      },
+      {
+        "id": "grok-agent-removed",
+        "title": "Deleted sidebar thread",
+        "isRemovedFromSidebar": true
+      }
+    ]
+  }
+}
