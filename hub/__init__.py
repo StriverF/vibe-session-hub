@@ -16,4 +16,13 @@ def _load_version() -> str:
     return "1.0.0"
 
 
+def _load_build_id() -> str:
+    build_file = Path(__file__).resolve().parent.parent / "BUILD_ID"
+    try:
+        return build_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
 __version__ = _load_version()
+__build_id__ = _load_build_id()

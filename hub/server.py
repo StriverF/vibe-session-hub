@@ -5,6 +5,8 @@ import html
 import json
 import logging
 import mimetypes
+import os
+import signal
 import sys
 import threading
 import time
@@ -15,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import __version__
+from . import __build_id__, __version__
 from .config import (
     DEFAULT_HOST,
     DEFAULT_PORT,
@@ -34,10 +36,12 @@ from .launcher import (
 )
 from .storage import SessionHubStore
 from .tool_registry import export_client_tool_catalog
+from .updater import UpdateChecker
 
 logger = logging.getLogger("vibe_session_hub.server")
 
-STATIC_DIR = (Path(__file__).resolve().parent.parent / "static").resolve()
+BACKEND_ROOT = Path(__file__).resolve().parent.parent.resolve()
+STATIC_DIR = (BACKEND_ROOT / "static").resolve()
 
 
 def is_path_within(candidate: Path, base_dir: Path) -> bool:
@@ -191,9 +195,24 @@ class HubHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         handler_class: type[BaseHTTPRequestHandler],
         store: SessionHubStore,
+        updater: UpdateChecker | None = None,
     ) -> None:
         self.store = store
+        self.updater = updater or UpdateChecker(backend_root=BACKEND_ROOT)
+        self._shutdown_requested = threading.Event()
         super().__init__(server_address, handler_class)
+
+    def request_shutdown(self, delay_sec: float = 0.05) -> None:
+        """Schedule a graceful non-blocking server shutdown once."""
+        if self._shutdown_requested.is_set():
+            return
+        self._shutdown_requested.set()
+        if delay_sec > 0:
+            timer = threading.Timer(delay_sec, self.shutdown)
+            timer.daemon = True
+            timer.start()
+        else:
+            threading.Thread(target=self.shutdown, daemon=True).start()
 
 
 class HubRequestHandler(BaseHTTPRequestHandler):
@@ -207,6 +226,12 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         if injected is not None:
             return injected
         return self.store
+
+    def _get_updater(self) -> UpdateChecker:
+        injected = getattr(self.server, "updater", None)
+        if injected is not None:
+            return injected
+        return UpdateChecker(backend_root=BACKEND_ROOT)
 
     def _get_machine_info(self) -> dict[str, Any]:
         store = self._get_store()
@@ -243,6 +268,24 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             "port": port,
             "base_url": f"http://{host}:{port}",
             "version": __version__,
+            "build_id": __build_id__,
+            "backend_root": str(BACKEND_ROOT),
+            "pid": os.getpid(),
+        }
+
+    def _build_health_payload(self) -> dict[str, Any]:
+        store = self._get_store()
+        health = store.get_sync_health()
+        server_info = self._get_server_info()
+        return {
+            "ok": True,
+            "version": __version__,
+            "build_id": __build_id__,
+            "backend_root": server_info["backend_root"],
+            "port": server_info["port"],
+            "server": server_info,
+            "machine": self._get_machine_info(),
+            **health,
         }
 
     def _verify_same_origin_post(self) -> bool:
@@ -313,20 +356,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/health":
-            store = self._get_store()
-            health = store.get_sync_health()
-            server_info = self._get_server_info()
-            self._send_json(
-                {
-                    "ok": True,
-                    "version": __version__,
-                    "port": server_info["port"],
-                    "server": server_info,
-                    "machine": self._get_machine_info(),
-                    **health,
-                },
-                head_only=True,
-            )
+            self._send_json(self._build_health_payload(), head_only=True)
             return
         if path.startswith("/api/"):
             self.send_error(HTTPStatus.METHOD_NOT_ALLOWED, "Method Not Allowed")
@@ -356,18 +386,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         store = self._get_store()
 
         if path == "/api/health":
-            health = store.get_sync_health()
-            server_info = self._get_server_info()
-            self._send_json(
-                {
-                    "ok": True,
-                    "version": __version__,
-                    "port": server_info["port"],
-                    "server": server_info,
-                    "machine": self._get_machine_info(),
-                    **health,
-                }
-            )
+            self._send_json(self._build_health_payload())
             return
 
         if path == "/api/tools":
@@ -384,6 +403,22 @@ class HubRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/preferences":
             self._send_json({"ok": True, "preferences": self._get_preferences()})
+            return
+
+        if path == "/api/update/status":
+            updater = self._get_updater()
+            self._send_json(updater.get_status())
+            return
+
+        if path == "/api/update/changelog":
+            updater = self._get_updater()
+            self._send_json(
+                {
+                    "ok": True,
+                    "current_version": updater.current_version,
+                    "entries": updater.get_changelog(),
+                }
+            )
             return
 
         if path == "/api/search":
@@ -459,7 +494,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             else (ctype or "application/octet-stream"),
         )
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.end_headers()
         if not head_only:
             self.wfile.write(data)
@@ -539,6 +574,24 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "preferences": prefs})
             return
 
+        if path == "/api/update/check":
+            updater = self._get_updater()
+            self._send_json(updater.check_now())
+            return
+
+        if path == "/api/shutdown":
+            self._send_json({"ok": True, "stopping": True, "pid": os.getpid()})
+            request_shutdown = getattr(self.server, "request_shutdown", None)
+            if callable(request_shutdown):
+                request_shutdown(delay_sec=0.05)
+            else:
+                shutdown_fn = getattr(self.server, "shutdown", None)
+                if callable(shutdown_fn):
+                    timer = threading.Timer(0.05, shutdown_fn)
+                    timer.daemon = True
+                    timer.start()
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
 
@@ -546,9 +599,10 @@ def create_http_server(
     store: SessionHubStore,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
+    updater: UpdateChecker | None = None,
 ) -> HubHTTPServer:
     """Create a ThreadingHTTPServer bound to the given SessionHubStore without global state."""
-    return HubHTTPServer((host, port), HubRequestHandler, store=store)
+    return HubHTTPServer((host, port), HubRequestHandler, store=store, updater=updater)
 
 
 def _background_sync_loop(store: SessionHubStore, interval_sec: int = 90) -> None:
@@ -592,6 +646,14 @@ def main(argv: list[str] | None = None) -> None:
     bg.start()
 
     server = create_http_server(store, host=DEFAULT_HOST, port=listen_port)
+
+    def _handle_sigterm(signum: int, _frame: Any) -> None:
+        logger.info("Received signal %s; shutting down Vibe Session Hub", signum)
+        server.request_shutdown(delay_sec=0.0)
+
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _handle_sigterm)
+
     url = f"http://{DEFAULT_HOST}:{server.server_port}"
     print(
         f"Vibe Session Hub v{__version__} listening on {url} ({info['total_sessions']} sessions indexed)",
@@ -600,10 +662,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.open_browser:
         webbrowser.open(url)
     try:
-        server.serve_forever()
+        server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:
-        server.server_close()
+        pass
     finally:
+        server.server_close()
         store.close()
 
 

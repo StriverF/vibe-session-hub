@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+- **In-App Update Check, Download, Verify & Restart (bowel-inspired)**: Added an adaptive update indicator and Software Update / What's New modal right before the **配色主题** button in the top bar (plus a native `检查更新…` app menu item), backed by `macos/AppUpdater.swift` (GitHub Releases background/manual checks, streaming DMG download with live progress & cancel, mandatory SHA-256 + `codesign` + TeamIdentifier verification, safe staged swap-on-exit & relaunch, and post-restart "Updated to vX.Y.Z" notice) and `hub/updater.py` (browser-mode fallback & bundled `CHANGELOG.md` viewer).
+
+### Fixed
+- **Automatic Stale Backend Upgrade on macOS App Launch**: Exposed `backend_root`, `build_id`, and `pid` on `/api/health`, added graceful `SIGTERM` / same-origin `POST /api/shutdown` handling and `no-store` static cache headers in `hub/server.py`, and updated `VibeSessionHub.swift` (`macos/BackendUpgradeLogic.swift`) to automatically detect older or mismatched background LaunchAgent/fallback backends, safely upgrade and reload them to the current app bundle (guarding against read-only DMG / AppTranslocation paths and never downgrading newer versions), and clear WebView disk/memory cache on upgrade.
+
 ## [1.0.0] - 2026-11-23
 
 ### Added
