@@ -24,9 +24,13 @@ logger = logging.getLogger("vibe_session_hub.collectors.grok_bot")
 
 
 def collect_grok_bot_sessions(
-    machine_id: str, machine_name: str, cache: FileParseCache
+    machine_id: str,
+    machine_name: str,
+    cache: FileParseCache,
+    *,
+    persistence_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
-    scp = Path(
+    scp = persistence_dir or Path(
         os.path.expanduser(
             "~/Library/Application Support/Grok Bot/sand-client-persistence"
         )

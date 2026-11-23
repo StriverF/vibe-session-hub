@@ -1,0 +1,21 @@
+{
+  "sessionId": "local_claude_001",
+  "cliSessionId": "cli-sess-001",
+  "title": "Fix OAuth callback redirect loop",
+  "originCwd": "/Users/dev/workspace/demo-app",
+  "createdAt": "2026-10-15T09:00:00Z",
+  "lastActivityAt": "2026-10-15T09:42:00Z",
+  "writtenBranches": ["fix/oauth-callback"],
+  "previousTitles": ["Investigate login redirect"],
+  "postTurnSummary": {
+    "status_detail": "Patched state nonce validation and added unit tests for callback URL handling."
+  },
+  "prs": [
+    {
+      "prNumber": "1042",
+      "repo": "acme/demo-app",
+      "branch": "fix/oauth-callback"
+    }
+  ],
+  "isArchived": false
+}

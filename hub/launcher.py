@@ -58,14 +58,29 @@ def _run_open(args: list[str]) -> tuple[bool, str]:
 
 
 def _find_send_url_helper() -> str | None:
-    candidates = [
-        PROJECT_ROOT / "macos" / "bin" / "send_url_to_pid",
-        PROJECT_ROOT.parent
-        / "Vibe Session Hub.app"
-        / "Contents"
-        / "MacOS"
-        / "send_url_to_pid",
-    ]
+    candidates: list[Path] = []
+    env_bin = os.environ.get("VIBE_HUB_SEND_URL_BIN", "").strip()
+    if env_bin:
+        candidates.append(Path(env_bin))
+    candidates.extend(
+        [
+            PROJECT_ROOT / "macos" / "bin" / "send_url_to_pid",
+            # Standalone .app bundle layout: Contents/Resources/app/hub -> Contents/MacOS/send_url_to_pid
+            PROJECT_ROOT.parent.parent / "MacOS" / "send_url_to_pid",
+            PROJECT_ROOT.parent
+            / "Vibe Session Hub.app"
+            / "Contents"
+            / "MacOS"
+            / "send_url_to_pid",
+            Path("/Applications/Vibe Session Hub.app/Contents/MacOS/send_url_to_pid"),
+            Path.home()
+            / "Applications"
+            / "Vibe Session Hub.app"
+            / "Contents"
+            / "MacOS"
+            / "send_url_to_pid",
+        ]
+    )
     for c in candidates:
         if c.is_file() and os.access(c, os.X_OK):
             return str(c)

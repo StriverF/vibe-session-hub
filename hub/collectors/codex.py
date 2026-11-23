@@ -6,6 +6,7 @@ import os
 import sqlite3
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from ..launcher import build_native_deep_link
 from .base import (
@@ -25,17 +26,22 @@ logger = logging.getLogger("vibe_session_hub.collectors.codex")
 
 
 def collect_codex_sessions(
-    machine_id: str, machine_name: str, cache: FileParseCache
+    machine_id: str,
+    machine_name: str,
+    cache: FileParseCache,
+    *,
+    state_db: Path | None = None,
+    hist_db: Path | None = None,
 ) -> list[dict[str, Any]]:
-    state_db = Path(os.path.expanduser("~/.codex/state_5.sqlite"))
-    hist_db = Path(os.path.expanduser("~/.codex/thread_history_1.sqlite"))
+    state_db = state_db or Path(os.path.expanduser("~/.codex/state_5.sqlite"))
+    hist_db = hist_db or Path(os.path.expanduser("~/.codex/thread_history_1.sqlite"))
     if not state_db.exists():
         return []
 
     results: list[dict[str, Any]] = []
     con: sqlite3.Connection | None = None
     try:
-        con = sqlite3.connect(f"file:{state_db}?immutable=1", uri=True)
+        con = sqlite3.connect(f"file:{quote(str(state_db))}?immutable=1", uri=True)
         con.row_factory = sqlite3.Row
         threads = con.execute(
             """
@@ -58,7 +64,7 @@ def collect_codex_sessions(
     hist_con: sqlite3.Connection | None = None
     if hist_db.exists():
         try:
-            hist_con = sqlite3.connect(f"file:{hist_db}?immutable=1", uri=True)
+            hist_con = sqlite3.connect(f"file:{quote(str(hist_db))}?immutable=1", uri=True)
         except Exception as exc:
             logger.debug("Failed to open Codex history DB %s: %s", hist_db, exc)
             hist_con = None

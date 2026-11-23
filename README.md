@@ -63,6 +63,22 @@
 
 ## 快速安装（macOS 13+）
 
+### 方式一：下载 `.dmg` 安装包（推荐）
+
+前往 [GitHub Releases](https://github.com/StriverF/vibe-session-hub/releases) 查看各版本更新内容并下载最新的 Universal 安装包（同时原生支持 Apple Silicon 与 Intel Mac）：
+
+1. 下载 `Vibe-Session-Hub-vX.Y.Z-macos-universal.dmg` 并双击挂载；
+2. 将 **`Vibe Session Hub.app`** 拖入右侧 **`Applications`** 文件夹；
+3. 双击启动即可（应用已内置完整 Python 后端与前端资源，零第三方依赖）；
+4. 如需关闭窗口后仍保持后台增量同步与跨机跳转服务运行，在菜单栏点击 **`Vibe Session Hub → 安装 / 更新开机后台服务`** 即可一键启用 LaunchAgent。
+
+> 若首次启动时 macOS Gatekeeper 提示无法验证开发者（开源 Ad-hoc 签名构建），在终端执行一次即可放行：
+> ```bash
+> xattr -cr "/Applications/Vibe Session Hub.app"
+> ```
+
+### 方式二：从源码一键编译安装
+
 本项目无需安装任何第三方依赖包，克隆仓库后一行命令即可完成原生 `.app` 编译与后台增量索引服务配置：
 
 ```bash
@@ -72,10 +88,27 @@ bash install.sh
 ```
 
 执行 `install.sh` 会自动完成以下 4 步：
-1. 编译生成原生 macOS 应用 `../Vibe Session Hub.app`（自带高清圆角图标与 `vibehub://` 协议支持，可直接拖入 `/Applications` 或固定到程序坞 Dock）；
+1. 调用 `scripts/package_macos.sh` 编译生成原生 macOS 应用 `../Vibe Session Hub.app`（自带高清圆角图标、`vibehub://` 协议与完整内置运行时，可直接拖入 `/Applications` 或固定到程序坞 Dock）；
 2. 执行首次全量增量扫描，构建本地 SQLite FTS5 索引（`~/.vibe-session-hub/index.db`）；
-3. 注册并启动后台常驻守护服务 `~/Library/LaunchAgents/com.vibesessionhub.app.plist`（监听 `http://127.0.0.1:17380`，定期增量采集最新会话）；
+3. 注册并启动后台常驻守护服务 `~/Library/LaunchAgents/com.vibesessionhub.app.plist`（默认监听 `http://127.0.0.1:17380`，支持通过 `VIBE_HUB_PORT` 自定义端口）；
 4. 若当前 Mac 已开启 iCloud Drive，自动导出本机节点分片至 `~/Library/Mobile Documents/com~apple~CloudDocs/VibeSessionHub/`，并生成跨机便携安装脚本。
+
+---
+
+## 本地构建 DMG 与按版本自动发布（CI/CD）
+
+- **本地打 Universal `.dmg` 包**：
+  ```bash
+  bash scripts/package_macos.sh --version 1.0.0 --arch universal
+  ```
+  产物将生成在 `dist/Vibe-Session-Hub-v1.0.0-macos-universal.dmg` 与 `.sha256` 校验文件。
+- **自动 CI 验证**（`.github/workflows/ci.yml`）：每次 Push / Pull Request 到 `main` 时自动在 Linux（Python 3.9 & 3.12）和 macOS 15（系统 Python 3.9 + Swift Universal `.app` 构建 + 自定义端口烟雾测试）执行零依赖测试套件。
+- **按版本自动发布 Release**（`.github/workflows/release.yml`）：更新 `VERSION` 与 `CHANGELOG.md` 后推送版本标签即可自动跑测、构建 Universal `.dmg`、在只读挂载卷中做冒烟验证并发布至 [Releases](https://github.com/StriverF/vibe-session-hub/releases)：
+  ```bash
+  git tag -a v1.0.0 -m "Release v1.0.0"
+  git push origin v1.0.0
+  ```
+  亦可在 GitHub Actions 页面手动触发 **`Release macOS DMG`** 工作流并填写版本号。
 
 ---
 
@@ -109,28 +142,42 @@ bash "$HOME/Library/Mobile Documents/com~apple~CloudDocs/VibeSessionHub/install-
 
 ```text
 vibe-session-hub/
+├── .github/
+│   ├── release.yml            # GitHub Release 自动分类规则
+│   └── workflows/
+│       ├── ci.yml             # Linux + macOS 零依赖测试与 Universal App 构建校验
+│       └── release.yml        # vX.Y.Z 标签驱动：全量验测、构建 .dmg 并发布 GitHub Releases
 ├── hub/
-│   ├── collectors/         # 模块化只读采集器插件包（base / claude / codex / cursor / gemini / grok_bot / antigravity）
-│   ├── config.py           # 端口、HubPaths 依赖注入容器、机器硬件指纹、日志与主题偏好管理
-│   ├── tool_registry.py    # 全栈工具元数据单一事实源（标签、图标、Bundle ID、深链协议、手动登记选项）
-│   ├── sync_mirror.py      # 跨进程 flock 锁、内容哈希原子写入与单向所有权 iCloud 分片镜像
-│   ├── shard_ingestor.py   # JSONL 分片解析、手动 PR 链接合并与按行 SHA-256 增量入库引擎
-│   ├── search_engine.py    # SQLite FTS5 trigram 全文检索、PR singleflight 反查与 Facets 聚合
-│   ├── storage.py          # WAL 数据库连接/Schema 管理与存储协调门面（SessionHubStore）
-│   ├── git_pr_resolver.py  # 本地 git log 提交历史与 gh CLI 远端 PR 分支反查器
-│   ├── launcher.py         # 基于工具注册表与策略分发表的原生 Deep-Link 安全唤起逻辑
-│   └── server.py           # 本地 HTTP API、静态 ES 模块服务与后台定时增量同步守护线程
+│   ├── collectors/            # 模块化只读采集器插件包（base / claude / codex / cursor / gemini / grok_bot / antigravity）
+│   ├── config.py              # 端口解析透传、HubPaths 依赖注入容器、机器硬件指纹、日志与主题偏好管理
+│   ├── tool_registry.py       # 全栈工具元数据单一事实源（标签、图标、Bundle ID、深链协议、手动登记选项）
+│   ├── sync_mirror.py         # 跨进程 flock 锁、内容哈希原子写入与单向所有权 iCloud 分片镜像
+│   ├── shard_ingestor.py      # JSONL 分片解析、手动 PR 链接合并与按行 SHA-256 增量入库引擎
+│   ├── search_engine.py       # SQLite FTS5 trigram 全文检索、PR singleflight 反查与 Facets 聚合
+│   ├── storage.py             # WAL 数据库连接/Schema 管理与存储协调门面（SessionHubStore）
+│   ├── git_pr_resolver.py     # 本地 git log 提交历史与 gh CLI 远端 PR 分支反查器
+│   ├── launcher.py            # 基于工具注册表与策略分发表的原生 Deep-Link 安全唤起逻辑
+│   └── server.py              # 本地 HTTP API、加固静态 ES 模块服务与后台定时增量同步守护线程
 ├── macos/
-│   ├── VibeSessionHub.swift   # 原生 macOS AppKit + WKWebView 桌面窗口容器与 iCloud 桥接
+│   ├── VibeSessionHub.swift   # 原生 macOS AppKit + WKWebView 桌面容器、自定义端口透传与独立运行支持
 │   ├── build_icon.swift       # 自动生成全尺寸 macOS AppIcon.icns 与高清图标
 │   └── send_url_to_pid.swift  # 按指定进程 PID 精准投递 AppleEvent GURL 深链
+├── scripts/
+│   ├── package_macos.sh       # 独立 .app 打包与 Universal macOS .dmg + SHA-256 生成脚本
+│   └── extract_release_notes.py # 从 CHANGELOG.md 提取版本说明并拼接安装指引与校验和
 ├── static/
-│   ├── index.html          # 搜索工作台与主题/PR 绑定交互界面
-│   ├── styles.css          # 星环极光默认暗黑配色及全部 9 套主题样式表
-│   ├── js/                 # 原生无构建 ES 模块（state / api / utils / theme / render / main）
-│   └── icons/              # 官方应用 Logo 与各 Agent 工具高清图标
-├── tests/                  # P0 性能/一致性测试与 P1 架构/DI/模块化测试套件
-└── install.sh              # 一键编译打包、LaunchAgent 注册与 iCloud 同步配置脚本
+│   ├── index.html             # 搜索工作台与主题/PR 绑定交互界面
+│   ├── styles.css             # 星环极光默认暗黑配色及全部 9 套主题样式表
+│   ├── js/                    # 原生无构建 ES 模块（state / api / utils / theme / render / main）
+│   └── icons/                 # 官方应用 Logo 与各 Agent 工具高清图标
+├── tests/
+│   ├── fixtures/              # 全部 7 个客户端的纯文本脱敏采集 Fixture
+│   ├── test_p0_optimizations.py
+│   ├── test_p1_architecture.py
+│   └── test_p2_collectors_and_security.py
+├── VERSION                    # 版本号单一事实源
+├── CHANGELOG.md               # 版本变更日志（自动同步至 GitHub Release 说明）
+└── install.sh                 # 源码一键编译、LaunchAgent 注册与 iCloud 同步配置脚本
 ```
 
 ### 运行时本地路径与服务管理

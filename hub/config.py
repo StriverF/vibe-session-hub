@@ -8,13 +8,69 @@ import socket
 import subprocess
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("vibe_session_hub.config")
 
-DEFAULT_PORT = int(os.environ.get("VIBE_HUB_PORT", "17380"))
+FALLBACK_PORT = 17380
+
+
+def parse_port(raw: Any, default: int = FALLBACK_PORT) -> int:
+    """Parse and validate a TCP port (1..65535), falling back cleanly on invalid values."""
+    if raw is None or isinstance(raw, bool):
+        return default
+    text = str(raw).strip()
+    if not text:
+        return default
+    try:
+        port = int(text)
+    except ValueError:
+        logger.warning("Invalid port value %r; falling back to %d", raw, default)
+        return default
+    if 1 <= port <= 65535:
+        return port
+    logger.warning("Out-of-range port %d; falling back to %d", port, default)
+    return default
+
+
+def resolve_configured_port(
+    cli_port: int | None = None,
+    preferences_file: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """Resolve effective listen port: CLI --port > VIBE_HUB_PORT env > preferences.json > 17380."""
+    if cli_port is not None and not isinstance(cli_port, bool):
+        parsed_cli = parse_port(cli_port, default=0)
+        if parsed_cli:
+            return parsed_cli
+
+    environ = os.environ if env is None else env
+    env_raw = environ.get("VIBE_HUB_PORT")
+    if env_raw is not None and str(env_raw).strip():
+        parsed_env = parse_port(env_raw, default=0)
+        if parsed_env:
+            return parsed_env
+
+    target_file = preferences_file or PREFERENCES_FILE
+    if target_file.exists():
+        try:
+            raw = json.loads(target_file.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("port") is not None:
+                parsed_pref = parse_port(raw.get("port"), default=0)
+                if parsed_pref:
+                    return parsed_pref
+        except Exception as exc:
+            logger.debug(
+                "Ignoring unreadable port setting in %s: %s", target_file, exc
+            )
+
+    return FALLBACK_PORT
+
+
+DEFAULT_PORT = parse_port(os.environ.get("VIBE_HUB_PORT"), FALLBACK_PORT)
 DEFAULT_HOST = "127.0.0.1"
 
 LOCAL_STATE_DIR = Path(
@@ -308,27 +364,38 @@ def update_machine_name(
     return dict(info)
 
 
-def get_preferences(preferences_file: Path | None = None) -> dict[str, str]:
+def get_preferences(preferences_file: Path | None = None) -> dict[str, Any]:
     target_file = preferences_file or PREFERENCES_FILE
     if preferences_file is None:
         ensure_dirs(local_only=True)
-    prefs = dict(DEFAULT_PREFERENCES)
+    prefs: dict[str, Any] = dict(DEFAULT_PREFERENCES)
     if target_file.exists():
         try:
             raw = json.loads(target_file.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and raw.get("theme") in VALID_THEMES:
-                prefs["theme"] = str(raw["theme"])
+            if isinstance(raw, dict):
+                if raw.get("theme") in VALID_THEMES:
+                    prefs["theme"] = str(raw["theme"])
+                if raw.get("port") is not None:
+                    parsed_port = parse_port(raw.get("port"), default=0)
+                    if parsed_port:
+                        prefs["port"] = parsed_port
         except Exception as exc:
             logger.debug("Ignoring unreadable preferences file %s: %s", target_file, exc)
     return prefs
 
 
 def update_preferences(
-    theme: str | None = None, preferences_file: Path | None = None
+    theme: str | None = None,
+    port: int | None = None,
+    preferences_file: Path | None = None,
 ) -> dict[str, Any]:
     target_file = preferences_file or PREFERENCES_FILE
     prefs = get_preferences(preferences_file=target_file)
     if theme and theme in VALID_THEMES:
         prefs["theme"] = theme
+    if port is not None:
+        parsed_port = parse_port(port, default=0)
+        if parsed_port:
+            prefs["port"] = parsed_port
     _write_json_atomic(target_file, prefs)
     return prefs

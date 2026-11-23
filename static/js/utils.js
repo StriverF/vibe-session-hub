@@ -1,4 +1,4 @@
-import { els, getToolIcon } from "./state.js";
+import { els, getServerBaseUrl, getToolIcon } from "./state.js";
 
 let toastTimer = null;
 
@@ -68,5 +68,5 @@ export function buildCrossMacJumpUrl(item) {
     tool: item.tool,
     id: item.session_id,
   });
-  return `http://127.0.0.1:17380/jump?${params.toString()}`;
+  return `${getServerBaseUrl()}/jump?${params.toString()}`;
 }
