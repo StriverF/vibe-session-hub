@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import html
 import json
+import logging
 import mimetypes
 import sys
 import threading
@@ -16,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from .config import (
     DEFAULT_HOST,
     DEFAULT_PORT,
+    configure_logging,
     get_machine_info,
     get_preferences,
     update_machine_name,
@@ -28,8 +31,11 @@ from .launcher import (
     open_verified_session_locally,
 )
 from .storage import SessionHubStore
+from .tool_registry import export_client_tool_catalog
 
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+logger = logging.getLogger("vibe_session_hub.server")
+
+STATIC_DIR = (Path(__file__).resolve().parent.parent / "static").resolve()
 
 
 def _render_jump_html(
@@ -124,11 +130,56 @@ def _render_jump_html(
     return page.encode("utf-8")
 
 
+class HubHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer carrying an injected SessionHubStore instance."""
+
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        handler_class: type[BaseHTTPRequestHandler],
+        store: SessionHubStore,
+    ) -> None:
+        self.store = store
+        super().__init__(server_address, handler_class)
+
+
 class HubRequestHandler(BaseHTTPRequestHandler):
     store: SessionHubStore
 
     def log_message(self, format: str, *args: Any) -> None:
         return
+
+    def _get_store(self) -> SessionHubStore:
+        injected = getattr(self.server, "store", None)
+        if injected is not None:
+            return injected
+        return self.store
+
+    def _get_machine_info(self) -> dict[str, Any]:
+        store = self._get_store()
+        if getattr(store, "_has_explicit_paths", False):
+            return get_machine_info(machine_file=store.paths.machine_file)
+        return get_machine_info()
+
+    def _update_machine_name(self, new_name: str) -> dict[str, Any]:
+        store = self._get_store()
+        if getattr(store, "_has_explicit_paths", False):
+            return update_machine_name(new_name, machine_file=store.paths.machine_file)
+        return update_machine_name(new_name)
+
+    def _get_preferences(self) -> dict[str, str]:
+        store = self._get_store()
+        if getattr(store, "_has_explicit_paths", False):
+            return get_preferences(preferences_file=store.paths.preferences_file)
+        return get_preferences()
+
+    def _update_preferences(self, theme: str | None) -> dict[str, Any]:
+        store = self._get_store()
+        if getattr(store, "_has_explicit_paths", False):
+            return update_preferences(
+                theme=theme, preferences_file=store.paths.preferences_file
+            )
+        return update_preferences(theme=theme)
 
     def _verify_same_origin_post(self) -> bool:
         if self.headers.get("X-Vibe-Hub") != "1":
@@ -138,7 +189,8 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             return False
         origin = (self.headers.get("Origin") or "").lower()
         if origin and not (
-            origin.startswith("http://127.0.0.1:") or origin.startswith("http://localhost:")
+            origin.startswith("http://127.0.0.1:")
+            or origin.startswith("http://localhost:")
         ):
             return False
         return True
@@ -164,18 +216,47 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
+        if path.startswith("/api/"):
+            try:
+                self._handle_api_get(path, qs)
+            except Exception as exc:
+                logger.exception("Unhandled error in GET %s", path)
+                self._send_json({"ok": False, "error": str(exc)}, status=500)
+            return
+
+        if path == "/jump":
+            self._handle_jump(qs)
+            return
+
+        self._serve_static(path)
+
+    def _handle_api_get(self, path: str, qs: dict[str, list[str]]) -> None:
+        store = self._get_store()
+
         if path == "/api/health":
-            self._send_json({"ok": True, "machine": get_machine_info()})
+            health = store.get_sync_health()
+            self._send_json(
+                {
+                    "ok": True,
+                    "machine": self._get_machine_info(),
+                    **health,
+                }
+            )
+            return
+
+        if path == "/api/tools":
+            self._send_json({"ok": True, **export_client_tool_catalog()})
             return
 
         if path == "/api/facets":
-            facets = self.store.get_facets()
-            facets["preferences"] = get_preferences()
+            facets = store.get_facets()
+            facets["preferences"] = self._get_preferences()
+            facets["tool_catalog"] = export_client_tool_catalog()
             self._send_json(facets)
             return
 
         if path == "/api/preferences":
-            self._send_json({"ok": True, "preferences": get_preferences()})
+            self._send_json({"ok": True, "preferences": self._get_preferences()})
             return
 
         if path == "/api/search":
@@ -184,7 +265,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             machine_id = (qs.get("machine_id") or [""])[0]
             only_pr = (qs.get("only_pr") or ["0"])[0] == "1"
             remote_pr = (qs.get("remote_pr") or ["0"])[0] == "1"
-            res = self.store.search(
+            res = store.search(
                 query=q,
                 tool=tool,
                 machine_id=machine_id,
@@ -194,48 +275,51 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self._send_json(res)
             return
 
-        if path == "/jump":
-            uid = (qs.get("uid") or [""])[0].strip()
-            tool = (qs.get("tool") or [""])[0].strip()
-            sid = (qs.get("id") or [""])[0].strip()
+        self._send_json({"ok": False, "error": "Not Found"}, status=404)
 
-            session = self.store.get_session_by_uid(uid) if uid else None
-            if session is None and tool and sid:
-                minfo = get_machine_info()
-                local_uid = f"{minfo['machine_id']}:{tool}:{sid}"
-                session = self.store.get_session_by_uid(local_uid)
+    def _handle_jump(self, qs: dict[str, list[str]]) -> None:
+        store = self._get_store()
+        uid = (qs.get("uid") or [""])[0].strip()
+        tool = (qs.get("tool") or [""])[0].strip()
+        sid = (qs.get("id") or [""])[0].strip()
 
-            if session is not None:
-                dl = build_native_deep_link(
-                    session.get("tool", ""),
-                    session.get("session_id", ""),
-                    session.get("external_url", ""),
-                )
-                body = _render_jump_html(
-                    verified_uid=str(session["uid"]),
-                    title=session.get("title") or session.get("session_id") or "打开会话",
-                    subtitle=f"{session.get('tool_label', '')} · {session.get('session_id', '')}",
-                    deep_link=dl,
-                )
-            else:
-                dl = build_native_deep_link(tool, sid)
-                body = _render_jump_html(
-                    verified_uid="",
-                    title=f"{tool} · {sid}" if tool else "未找到会话",
-                    subtitle="若刚从另一台电脑创建该会话，请返回主页点击「同步索引」后再试。",
-                    deep_link=dl,
-                )
+        session = store.get_session_by_uid(uid) if uid else None
+        if session is None and tool and sid:
+            minfo = self._get_machine_info()
+            local_uid = f"{minfo['machine_id']}:{tool}:{sid}"
+            session = store.get_session_by_uid(local_uid)
 
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+        if session is not None:
+            dl = build_native_deep_link(
+                session.get("tool", ""),
+                session.get("session_id", ""),
+                session.get("external_url", ""),
+            )
+            body = _render_jump_html(
+                verified_uid=str(session["uid"]),
+                title=session.get("title") or session.get("session_id") or "打开会话",
+                subtitle=f"{session.get('tool_label', '')} · {session.get('session_id', '')}",
+                deep_link=dl,
+            )
+        else:
+            dl = build_native_deep_link(tool, sid)
+            body = _render_jump_html(
+                verified_uid="",
+                title=f"{tool} · {sid}" if tool else "未找到会话",
+                subtitle="若刚从另一台电脑创建该会话，请返回主页点击「同步索引」后再试。",
+                deep_link=dl,
+            )
 
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_static(self, path: str) -> None:
         rel = "index.html" if path in ("/", "") else path.lstrip("/")
         file_path = (STATIC_DIR / rel).resolve()
-        if not str(file_path).startswith(str(STATIC_DIR)) or not file_path.is_file():
+        if not file_path.is_relative_to(STATIC_DIR) or not file_path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
             return
 
@@ -267,14 +351,34 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, status=400)
             return
 
+        try:
+            self._handle_api_post(path, body)
+        except Exception as exc:
+            logger.exception("Unhandled error in POST %s", path)
+            self._send_json({"ok": False, "error": str(exc)}, status=500)
+
+    def _handle_api_post(self, path: str, body: dict[str, Any]) -> None:
+        store = self._get_store()
+
         if path == "/api/sync":
-            res = self.store.sync_now(force_local=True)
+            bridge_synced = bool(body.get("bridge_synced", False))
+            skip_local = bool(body.get("skip_local", bridge_synced))
+            skip_icloud = bool(body.get("skip_icloud", bridge_synced))
+            force_local = bool(body.get("force_local", not skip_local))
+            force_reindex = bool(body.get("force_reindex", False))
+            res = store.sync_now(
+                force_local=force_local,
+                force_reindex=force_reindex,
+                skip_local=skip_local,
+                skip_icloud=skip_icloud,
+                bridge_synced=bridge_synced,
+            )
             self._send_json(res)
             return
 
         if path == "/api/open":
             uid = str(body.get("uid") or "").strip()
-            session = self.store.get_session_by_uid(uid) if uid else None
+            session = store.get_session_by_uid(uid) if uid else None
             if session is None:
                 self._send_json(
                     {"ok": False, "message": "拒绝打开：未在已验证的索引会话中找到该记录"},
@@ -286,14 +390,14 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/manual-link":
-            entry = self.store.add_manual_link(body)
+            entry = store.add_manual_link(body)
             self._send_json({"ok": True, "entry": entry})
             return
 
         if path == "/api/machine-name":
             new_name = str(body.get("machine_name") or "").strip()
-            info = update_machine_name(new_name)
-            self.store.sync_now(force_local=True)
+            info = self._update_machine_name(new_name)
+            store.sync_now(force_local=True)
             self._send_json({"ok": True, "machine": info})
             return
 
@@ -304,56 +408,72 @@ class HubRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/preferences":
             theme = str(body.get("theme") or "").strip() or None
-            prefs = update_preferences(theme=theme)
+            prefs = self._update_preferences(theme=theme)
             self._send_json({"ok": True, "preferences": prefs})
             return
 
         self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
 
+def create_http_server(
+    store: SessionHubStore,
+    host: str = DEFAULT_HOST,
+    port: int = DEFAULT_PORT,
+) -> HubHTTPServer:
+    """Create a ThreadingHTTPServer bound to the given SessionHubStore without global state."""
+    return HubHTTPServer((host, port), HubRequestHandler, store=store)
+
+
 def _background_sync_loop(store: SessionHubStore, interval_sec: int = 90) -> None:
     while True:
         try:
             store.sync_now(force_local=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Background sync iteration failed: %s", exc)
         time.sleep(interval_sec)
 
 
-def main() -> None:
-    port = DEFAULT_PORT
-    for i, arg in enumerate(sys.argv[1:], start=1):
-        if arg == "--port" and i < len(sys.argv) - 1:
-            port = int(sys.argv[i + 1])
-        elif arg.startswith("--port="):
-            port = int(arg.split("=", 1)[1])
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Vibe Session Hub local server")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--open", dest="open_browser", action="store_true")
+    parser.add_argument("--sync-once", dest="sync_only", action="store_true")
+    parser.add_argument("--local-only", dest="local_only", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--cwd", type=str, default="", help=argparse.SUPPRESS)
+    args, _ = parser.parse_known_args(argv)
+    return args
 
-    open_browser = "--open" in sys.argv
-    sync_only = "--sync-once" in sys.argv
-    local_only = "--local-only" in sys.argv
 
-    store = SessionHubStore(local_only=local_only)
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    configure_logging(verbose=args.verbose)
+
+    store = SessionHubStore(local_only=args.local_only)
     info = store.sync_now(force_local=True)
-    if sync_only:
+    if args.sync_only:
         print(json.dumps(info, ensure_ascii=False, indent=2))
+        store.close()
         return
 
     HubRequestHandler.store = store
     bg = threading.Thread(target=_background_sync_loop, args=(store, 90), daemon=True)
     bg.start()
 
-    server = ThreadingHTTPServer((DEFAULT_HOST, port), HubRequestHandler)
-    url = f"http://{DEFAULT_HOST}:{port}"
+    server = create_http_server(store, host=DEFAULT_HOST, port=args.port)
+    url = f"http://{DEFAULT_HOST}:{args.port}"
     print(
         f"Vibe Session Hub listening on {url} ({info['total_sessions']} sessions indexed)",
         flush=True,
     )
-    if open_browser:
+    if args.open_browser:
         webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         server.server_close()
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":
