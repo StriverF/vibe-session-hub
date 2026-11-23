@@ -165,7 +165,14 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == "/api/health":
-            self._send_json({"ok": True, "machine": get_machine_info()})
+            health = self.store.get_sync_health()
+            self._send_json(
+                {
+                    "ok": True,
+                    "machine": get_machine_info(),
+                    **health,
+                }
+            )
             return
 
         if path == "/api/facets":
@@ -268,7 +275,18 @@ class HubRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/sync":
-            res = self.store.sync_now(force_local=True)
+            bridge_synced = bool(body.get("bridge_synced", False))
+            skip_local = bool(body.get("skip_local", bridge_synced))
+            skip_icloud = bool(body.get("skip_icloud", bridge_synced))
+            force_local = bool(body.get("force_local", not skip_local))
+            force_reindex = bool(body.get("force_reindex", False))
+            res = self.store.sync_now(
+                force_local=force_local,
+                force_reindex=force_reindex,
+                skip_local=skip_local,
+                skip_icloud=skip_icloud,
+                bridge_synced=bridge_synced,
+            )
             self._send_json(res)
             return
 
@@ -354,6 +372,8 @@ def main() -> None:
         server.serve_forever()
     except KeyboardInterrupt:
         server.server_close()
+    finally:
+        store.close()
 
 
 if __name__ == "__main__":

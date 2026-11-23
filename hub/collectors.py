@@ -120,9 +120,30 @@ def _parse_iso_to_ms(val: Any) -> int:
 
 
 class FileParseCache:
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    """In-memory snapshot + dirty-batch write cache for file parsing.
+
+    Separates disk scanning from SQLite write transactions so callers can load
+    existing entries via a read-only connection, parse all client stores without
+    holding any DB lock, and flush only modified entries in a short transaction.
+    """
+
+    def __init__(
+        self,
+        conn: sqlite3.Connection | None = None,
+        initial_entries: dict[str, tuple[int, int, str]] | None = None,
+    ) -> None:
         self.conn = conn
-        self.conn.execute(
+        self._entries: dict[str, tuple[int, int, str]] = {}
+        self._dirty: dict[str, tuple[int, int, str]] = {}
+        if initial_entries is not None:
+            self._entries.update(initial_entries)
+        elif conn is not None:
+            self.ensure_table(conn)
+            self._entries.update(self.load_entries(conn))
+
+    @staticmethod
+    def ensure_table(conn: sqlite3.Connection) -> None:
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS file_parse_cache (
                 cache_key TEXT PRIMARY KEY,
@@ -133,20 +154,44 @@ class FileParseCache:
             """
         )
 
+    @staticmethod
+    def load_entries(conn: sqlite3.Connection) -> dict[str, tuple[int, int, str]]:
+        entries: dict[str, tuple[int, int, str]] = {}
+        try:
+            rows = conn.execute(
+                "SELECT cache_key, mtime_ns, size, payload_json FROM file_parse_cache"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return entries
+        for row in rows:
+            entries[str(row[0])] = (int(row[1]), int(row[2]), str(row[3]))
+        return entries
+
     def get(self, key: str, mtime_ns: int, size: int) -> dict[str, Any] | None:
-        row = self.conn.execute(
-            "SELECT payload_json FROM file_parse_cache WHERE cache_key = ? AND mtime_ns = ? AND size = ?",
-            (key, mtime_ns, size),
-        ).fetchone()
-        if not row:
+        hit = self._entries.get(key)
+        if not hit or hit[0] != mtime_ns or hit[1] != size:
             return None
         try:
-            return json.loads(row[0])
+            return json.loads(hit[2])
         except Exception:
             return None
 
     def put(self, key: str, mtime_ns: int, size: int, payload: dict[str, Any]) -> None:
-        self.conn.execute(
+        raw = json.dumps(payload, ensure_ascii=False)
+        entry = (mtime_ns, size, raw)
+        self._entries[key] = entry
+        self._dirty[key] = entry
+
+    @property
+    def dirty_rows(self) -> list[tuple[str, int, int, str]]:
+        return [(k, v[0], v[1], v[2]) for k, v in self._dirty.items()]
+
+    def flush_to_conn(self, conn: sqlite3.Connection) -> int:
+        if not self._dirty:
+            return 0
+        self.ensure_table(conn)
+        rows = self.dirty_rows
+        conn.executemany(
             """
             INSERT INTO file_parse_cache (cache_key, mtime_ns, size, payload_json)
             VALUES (?, ?, ?, ?)
@@ -155,8 +200,10 @@ class FileParseCache:
                 size = excluded.size,
                 payload_json = excluded.payload_json
             """,
-            (key, mtime_ns, size, json.dumps(payload, ensure_ascii=False)),
+            rows,
         )
+        self._dirty.clear()
+        return len(rows)
 
 
 def _parse_claude_jsonl(path: Path, cache: FileParseCache) -> dict[str, Any]:
@@ -1403,9 +1450,17 @@ def collect_gemini_sessions(
 
 
 def collect_all_local_sessions(
-    machine_id: str, machine_name: str, conn: sqlite3.Connection
+    machine_id: str,
+    machine_name: str,
+    conn: sqlite3.Connection | None = None,
+    cache: FileParseCache | None = None,
 ) -> list[dict[str, Any]]:
-    cache = FileParseCache(conn)
+    own_cache = cache is None
+    if cache is None:
+        if conn is not None:
+            cache = FileParseCache(conn=conn)
+        else:
+            cache = FileParseCache(initial_entries={})
     sessions: list[dict[str, Any]] = []
 
     sessions.extend(
@@ -1444,6 +1499,8 @@ def collect_all_local_sessions(
     sessions.extend(collect_grok_bot_sessions(machine_id, machine_name, cache))
     sessions.extend(collect_antigravity_sessions(machine_id, machine_name, cache))
 
-    conn.commit()
+    if own_cache and conn is not None:
+        cache.flush_to_conn(conn)
+        conn.commit()
     sessions.sort(key=lambda s: s.get("updated_at") or 0, reverse=True)
     return sessions

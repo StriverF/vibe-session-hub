@@ -31,10 +31,16 @@ def parse_pr_query(query: str) -> tuple[str | None, str | None]:
 
 
 def resolve_pr_from_local_git(
-    pr_number: str, candidate_repos: list[str]
+    pr_number: str,
+    candidate_repos: list[str],
+    total_budget_sec: float = 2.5,
 ) -> dict[str, Any] | None:
     seen: set[str] = set()
+    deadline = time.monotonic() + max(0.2, total_budget_sec)
     for repo_dir in candidate_repos:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            break
         if not repo_dir or repo_dir in seen:
             continue
         seen.add(repo_dir)
@@ -59,26 +65,30 @@ def resolve_pr_from_local_git(
                 ],
                 stderr=subprocess.DEVNULL,
                 text=True,
-                timeout=1.5,
+                timeout=min(1.5, remaining),
             ).strip()
             if not out:
                 continue
             sha, subject = out.split("\x1f", 1)
-            files_out = subprocess.check_output(
-                [
-                    "/usr/bin/git",
-                    "-C",
-                    str(p),
-                    "show",
-                    "--name-only",
-                    "--format=",
-                    sha,
-                ],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=1.5,
-            ).strip()
-            files = [f.strip() for f in files_out.splitlines() if f.strip()][:12]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                files = []
+            else:
+                files_out = subprocess.check_output(
+                    [
+                        "/usr/bin/git",
+                        "-C",
+                        str(p),
+                        "show",
+                        "--name-only",
+                        "--format=",
+                        sha,
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=min(1.5, remaining),
+                ).strip()
+                files = [f.strip() for f in files_out.splitlines() if f.strip()][:12]
             clean_title = re.sub(rf"\s*\(#{pr_number}\)\s*$", "", subject).strip()
             return {
                 "pr_number": pr_number,

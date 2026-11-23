@@ -1,4 +1,6 @@
 import AppKit
+import CryptoKit
+import Darwin
 import Foundation
 import WebKit
 
@@ -7,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     var webView: WKWebView!
     var backendProcess: Process?
     var syncTimer: Timer?
+    private let syncQueue = DispatchQueue(label: "com.vibesessionhub.icloud-bridge", qos: .utility)
     let hubURL = URL(string: "http://127.0.0.1:17380")!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -121,11 +124,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                 DispatchQueue.main.async {
                     self.webView.load(URLRequest(url: self.hubURL))
                 }
+                self.syncICloudBridgeAsync()
                 return
             }
             self.spawnFallbackBackend()
             self.pollUntilReady(attemptsLeft: 25)
         }
+    }
+
+    private func fetchSyncHealth(completion: @escaping ([String: Any]?) -> Void) {
+        var req = URLRequest(url: URL(string: "http://127.0.0.1:17380/api/health")!)
+        req.timeoutInterval = 1.2
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            guard let httpResp = resp as? HTTPURLResponse,
+                  httpResp.statusCode == 200,
+                  let data = data,
+                  let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                completion(nil)
+                return
+            }
+            completion(json)
+        }.resume()
     }
 
     private func checkHealth(completion: @escaping (Bool) -> Void) {
@@ -151,73 +170,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         backendProcess = proc
     }
 
+    private func sha256Hex(_ data: Data) -> String {
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
     private func startICloudBridgeTimer() {
-        syncICloudBridgeAsync()
         syncTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in
             self?.syncICloudBridgeAsync()
         }
     }
 
     private func syncICloudBridgeAsync() {
-        DispatchQueue.global(qos: .utility).async {
-            let fm = FileManager.default
-            let home = fm.homeDirectoryForCurrentUser
-            let localSync = home.appendingPathComponent(".vibe-session-hub/sync")
-            let icloudBase = home.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/VibeSessionHub")
-            guard fm.fileExists(atPath: home.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs").path) else {
+        fetchSyncHealth { [weak self] health in
+            guard let self = self, let health = health else { return }
+            if (health["local_only"] as? Bool) == true {
+                return
+            }
+            // Only act as iCloud bridge when backend explicitly delegates ownership (e.g. LaunchAgent TCC denial).
+            guard (health["sync_owner"] as? String) == "app_bridge" else {
+                return
+            }
+            guard let machine = health["machine"] as? [String: Any],
+                  let machineId = machine["machine_id"] as? String,
+                  !machineId.isEmpty else {
                 return
             }
 
-            var pulledRemoteChange = false
-            for sub in ["nodes", "manual_links"] {
-                let lDir = localSync.appendingPathComponent(sub)
-                let cDir = icloudBase.appendingPathComponent(sub)
-                try? fm.createDirectory(at: lDir, withIntermediateDirectories: true)
-                try? fm.createDirectory(at: cDir, withIntermediateDirectories: true)
+            self.syncQueue.async {
+                let fm = FileManager.default
+                let home = fm.homeDirectoryForCurrentUser
+                let localSync = home.appendingPathComponent(".vibe-session-hub/sync")
+                let icloudRoot = home.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs")
+                let icloudBase = icloudRoot.appendingPathComponent("VibeSessionHub")
+                guard fm.fileExists(atPath: icloudRoot.path) else {
+                    return
+                }
 
-                if let lFiles = try? fm.contentsOfDirectory(at: lDir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) {
-                    for lf in lFiles where lf.pathExtension == "jsonl" && !lf.lastPathComponent.hasPrefix(".") {
-                        let cf = cDir.appendingPathComponent(lf.lastPathComponent)
-                        let lAttr = try? fm.attributesOfItem(atPath: lf.path)
-                        let cAttr = try? fm.attributesOfItem(atPath: cf.path)
-                        let lDate = (lAttr?[.modificationDate] as? Date) ?? .distantPast
-                        let cDate = (cAttr?[.modificationDate] as? Date) ?? .distantPast
-                        let lSize = (lAttr?[.size] as? Int) ?? 0
-                        let cSize = (cAttr?[.size] as? Int) ?? -1
-                        if !fm.fileExists(atPath: cf.path) || (lDate > cDate && lSize != cSize) {
-                            if let data = try? Data(contentsOf: lf) {
-                                try? data.write(to: cf)
+                try? fm.createDirectory(at: localSync, withIntermediateDirectories: true)
+                let lockPath = localSync.appendingPathComponent(".sync.lock").path
+                // On macOS/BSD, O_EXLOCK | O_NONBLOCK atomically acquires a BSD flock(LOCK_EX | LOCK_NB)
+                // compatible with Python's fcntl.flock() and automatically releases on close(fd).
+                let fd = Darwin.open(lockPath, O_CREAT | O_RDWR | O_EXLOCK | O_NONBLOCK, S_IRUSR | S_IWUSR)
+                guard fd >= 0 else { return }
+                defer { Darwin.close(fd) }
+
+                let backendNeedsBridgeStatus = (health["icloud_status"] as? String) != "synced_via_app"
+                var pulledRemoteChange = false
+                var bridgeAccessible = false
+                let scopes: [(sub: String, ownFile: String)] = [
+                    ("nodes", "\(machineId).jsonl"),
+                    ("manual_links", "\(machineId)-links.jsonl"),
+                ]
+
+                for scope in scopes {
+                    let lDir = localSync.appendingPathComponent(scope.sub)
+                    let cDir = icloudBase.appendingPathComponent(scope.sub)
+                    try? fm.createDirectory(at: lDir, withIntermediateDirectories: true)
+                    do {
+                        try fm.createDirectory(at: cDir, withIntermediateDirectories: true)
+                        bridgeAccessible = true
+                    } catch {
+                        continue
+                    }
+
+                    // Trigger download of any evicted .icloud placeholder files
+                    if let cloudItems = try? fm.contentsOfDirectory(at: cDir, includingPropertiesForKeys: nil) {
+                        for item in cloudItems where item.lastPathComponent.hasPrefix(".") && item.lastPathComponent.hasSuffix(".icloud") {
+                            try? fm.startDownloadingUbiquitousItem(at: item)
+                        }
+                    }
+
+                    // PUSH strictly this machine's own shard (content-hashed + atomic write)
+                    let localOwn = lDir.appendingPathComponent(scope.ownFile)
+                    let cloudOwn = cDir.appendingPathComponent(scope.ownFile)
+                    if fm.fileExists(atPath: localOwn.path),
+                       let localData = try? Data(contentsOf: localOwn) {
+                        let localHash = self.sha256Hex(localData)
+                        let cloudHash = (try? Data(contentsOf: cloudOwn)).map { self.sha256Hex($0) }
+                        if cloudHash != localHash {
+                            try? localData.write(to: cloudOwn, options: .atomic)
+                        }
+                    }
+
+                    // PULL strictly remote machines' shards (content-hashed + atomic write)
+                    if let cFiles = try? fm.contentsOfDirectory(at: cDir, includingPropertiesForKeys: nil) {
+                        for cf in cFiles where cf.pathExtension == "jsonl"
+                            && !cf.lastPathComponent.hasPrefix(".")
+                            && cf.lastPathComponent != scope.ownFile {
+                            let lf = lDir.appendingPathComponent(cf.lastPathComponent)
+                            if let remoteData = try? Data(contentsOf: cf) {
+                                let remoteHash = self.sha256Hex(remoteData)
+                                let localHash = (try? Data(contentsOf: lf)).map { self.sha256Hex($0) }
+                                if localHash != remoteHash {
+                                    try? remoteData.write(to: lf, options: .atomic)
+                                    pulledRemoteChange = true
+                                }
                             }
                         }
                     }
                 }
 
-                if let cFiles = try? fm.contentsOfDirectory(at: cDir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) {
-                    for cf in cFiles where cf.pathExtension == "jsonl" && !cf.lastPathComponent.hasPrefix(".") {
-                        let lf = lDir.appendingPathComponent(cf.lastPathComponent)
-                        let cAttr = try? fm.attributesOfItem(atPath: cf.path)
-                        let lAttr = try? fm.attributesOfItem(atPath: lf.path)
-                        let cDate = (cAttr?[.modificationDate] as? Date) ?? .distantPast
-                        let lDate = (lAttr?[.modificationDate] as? Date) ?? .distantPast
-                        let cSize = (cAttr?[.size] as? Int) ?? 0
-                        let lSize = (lAttr?[.size] as? Int) ?? -1
-                        if !fm.fileExists(atPath: lf.path) || (cDate > lDate && cSize != lSize) {
-                            if let data = try? Data(contentsOf: cf) {
-                                try? data.write(to: lf, options: .atomic)
-                                pulledRemoteChange = true
-                            }
-                        }
-                    }
+                if bridgeAccessible && (pulledRemoteChange || backendNeedsBridgeStatus) {
+                    var req = URLRequest(url: URL(string: "http://127.0.0.1:17380/api/sync")!)
+                    req.httpMethod = "POST"
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.setValue("1", forHTTPHeaderField: "X-Vibe-Hub")
+                    req.httpBody = Data("{\"skip_icloud\":true,\"bridge_synced\":true}".utf8)
+                    URLSession.shared.dataTask(with: req).resume()
                 }
-            }
-
-            if pulledRemoteChange {
-                var req = URLRequest(url: URL(string: "http://127.0.0.1:17380/api/sync")!)
-                req.httpMethod = "POST"
-                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                req.setValue("1", forHTTPHeaderField: "X-Vibe-Hub")
-                req.httpBody = Data("{}".utf8)
-                URLSession.shared.dataTask(with: req).resume()
             }
         }
     }
@@ -236,6 +297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
                     DispatchQueue.main.async {
                         self.webView.load(URLRequest(url: self.hubURL))
                     }
+                    self.syncICloudBridgeAsync()
                 } else {
                     self.pollUntilReady(attemptsLeft: attemptsLeft - 1)
                 }

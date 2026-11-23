@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -100,38 +101,106 @@ def ensure_dirs(local_only: bool = False) -> None:
             pass
 
 
-def get_machine_info() -> dict[str, Any]:
-    ensure_dirs(local_only=True)
-    if MACHINE_FILE.exists():
-        try:
-            data = json.loads(MACHINE_FILE.read_text(encoding="utf-8"))
-            if data.get("machine_id") and data.get("machine_name"):
-                return data
-        except Exception:
-            pass
+_MACHINE_INFO_LOCK = threading.Lock()
+_MACHINE_INFO_CACHE: tuple[str, int, int, dict[str, Any]] | None = None
 
-    hw = _detect_hardware_uuid()
-    short_hash = hashlib.sha256(hw.encode("utf-8")).hexdigest()[:10]
-    info = {
-        "machine_id": f"mac-{short_hash}",
-        "machine_name": _detect_computer_name(),
-        "created_at": int(time.time() * 1000),
-    }
-    MACHINE_FILE.write_text(
-        json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    return info
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def get_machine_info() -> dict[str, Any]:
+    global _MACHINE_INFO_CACHE
+    path_str = str(MACHINE_FILE)
+
+    try:
+        st = MACHINE_FILE.stat()
+    except OSError:
+        st = None
+
+    cached = _MACHINE_INFO_CACHE
+    if (
+        st is not None
+        and cached is not None
+        and cached[0] == path_str
+        and cached[1] == st.st_mtime_ns
+        and cached[2] == st.st_size
+    ):
+        return dict(cached[3])
+
+    with _MACHINE_INFO_LOCK:
+        try:
+            st = MACHINE_FILE.stat()
+        except OSError:
+            st = None
+
+        cached = _MACHINE_INFO_CACHE
+        if (
+            st is not None
+            and cached is not None
+            and cached[0] == path_str
+            and cached[1] == st.st_mtime_ns
+            and cached[2] == st.st_size
+        ):
+            return dict(cached[3])
+
+        if st is not None:
+            try:
+                data = json.loads(MACHINE_FILE.read_text(encoding="utf-8"))
+                if data.get("machine_id") and data.get("machine_name"):
+                    _MACHINE_INFO_CACHE = (path_str, st.st_mtime_ns, st.st_size, dict(data))
+                    return dict(data)
+            except Exception:
+                pass
+
+        ensure_dirs(local_only=True)
+        hw = _detect_hardware_uuid()
+        short_hash = hashlib.sha256(hw.encode("utf-8")).hexdigest()[:10]
+        info = {
+            "machine_id": f"mac-{short_hash}",
+            "machine_name": _detect_computer_name(),
+            "created_at": int(time.time() * 1000),
+        }
+        _write_json_atomic(MACHINE_FILE, info)
+        try:
+            new_st = MACHINE_FILE.stat()
+            _MACHINE_INFO_CACHE = (path_str, new_st.st_mtime_ns, new_st.st_size, dict(info))
+        except OSError:
+            _MACHINE_INFO_CACHE = None
+        return dict(info)
 
 
 def update_machine_name(new_name: str) -> dict[str, Any]:
+    global _MACHINE_INFO_CACHE
     info = get_machine_info()
     cleaned = new_name.strip()
     if cleaned:
-        info["machine_name"] = cleaned
-        MACHINE_FILE.write_text(
-            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    return info
+        with _MACHINE_INFO_LOCK:
+            info["machine_name"] = cleaned
+            ensure_dirs(local_only=True)
+            _write_json_atomic(MACHINE_FILE, info)
+            try:
+                st = MACHINE_FILE.stat()
+                _MACHINE_INFO_CACHE = (
+                    str(MACHINE_FILE),
+                    st.st_mtime_ns,
+                    st.st_size,
+                    dict(info),
+                )
+            except OSError:
+                _MACHINE_INFO_CACHE = None
+    return dict(info)
 
 
 def get_preferences() -> dict[str, str]:
