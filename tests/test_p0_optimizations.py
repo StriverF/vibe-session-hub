@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -488,7 +489,28 @@ class TestP0ICloudOwnershipAndAtomicSync(IsolatedHubTestCase):
 
         # Simulate Swift holding BSD O_EXLOCK | O_NONBLOCK (exact macOS flag used by VibeSessionHub.swift)
         o_exlock = getattr(os, "O_EXLOCK", 0)
-        self.assertNotEqual(o_exlock, 0, "macOS must expose os.O_EXLOCK")
+        if o_exlock == 0:
+            if sys.platform == "darwin":
+                self.fail("macOS must expose os.O_EXLOCK")
+            # Non-BSD platforms (e.g. Linux CI): verify cross-fd fcntl.flock mutual exclusion directly
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with storage_mod._try_sync_file_lock(lock_path) as acquired:
+                    self.assertFalse(acquired)
+            finally:
+                os.close(fd)
+
+            with storage_mod._try_sync_file_lock(lock_path) as acquired:
+                self.assertTrue(acquired)
+                fd2 = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(fd2, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd2)
+            return
+
         swift_fd = os.open(
             str(lock_path), os.O_CREAT | os.O_RDWR | o_exlock | os.O_NONBLOCK, 0o600
         )

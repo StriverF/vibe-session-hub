@@ -102,13 +102,14 @@ bash install.sh
   bash scripts/package_macos.sh --version 1.0.0 --arch universal
   ```
   产物将生成在 `dist/Vibe-Session-Hub-v1.0.0-macos-universal.dmg` 与 `.sha256` 校验文件。
-- **自动 CI 验证**（`.github/workflows/ci.yml`）：每次 Push / Pull Request 到 `main` 时自动在 Linux（Python 3.9 & 3.12）和 macOS 15（系统 Python 3.9 + Swift Universal `.app` 构建 + 自定义端口烟雾测试）执行零依赖测试套件。
+- **自动 CI 验证**（`.github/workflows/ci.yml`）：每次 Push / Pull Request 到 `main` 时自动在 Linux（Python 3.12 & 3.13）和 macOS 15（系统 Python 3.9 + Swift Universal `.app` 构建 + 签名权限校验 + 自定义端口烟雾测试）执行零依赖测试套件。
 - **按版本自动发布 Release**（`.github/workflows/release.yml`）：更新 `VERSION` 与 `CHANGELOG.md` 后推送版本标签即可自动跑测、构建 Universal `.dmg`、在只读挂载卷中做冒烟验证并发布至 [Releases](https://github.com/StriverF/vibe-session-hub/releases)：
   ```bash
   git tag -a v1.0.0 -m "Release v1.0.0"
   git push origin v1.0.0
   ```
   亦可在 GitHub Actions 页面手动触发 **`Release macOS DMG`** 工作流并填写版本号。
+- **可选 Apple Developer ID 签名与公证**：在仓库 **Settings → Secrets and variables → Actions** 配置 `APPLE_SIGNING_CERT_P12`、`APPLE_SIGNING_CERT_PASSWORD`、`APPLE_SIGNING_IDENTITY`（及公证所需的 `APPLE_NOTARY_APPLE_ID`、`APPLE_NOTARY_PASSWORD`、`APPLE_TEAM_ID`）后，发布流程会自动启用 Hardened Runtime 由内向外签名 `.app` 与 `.dmg`、附带 `macos/entitlements.plist` AppleEvents 权限、执行 `notarytool` 公证与 `stapler` 装订，并通过 `spctl` Gatekeeper 校验。
 
 ---
 
@@ -161,6 +162,7 @@ vibe-session-hub/
 ├── macos/
 │   ├── VibeSessionHub.swift   # 原生 macOS AppKit + WKWebView 桌面容器、自定义端口透传与独立运行支持
 │   ├── build_icon.swift       # 自动生成全尺寸 macOS AppIcon.icns 与高清图标
+│   ├── entitlements.plist     # Hardened Runtime 最小权限集（AppleEvents 精准投递深链）
 │   └── send_url_to_pid.swift  # 按指定进程 PID 精准投递 AppleEvent GURL 深链
 ├── scripts/
 │   ├── package_macos.sh       # 独立 .app 打包与 Universal macOS .dmg + SHA-256 生成脚本

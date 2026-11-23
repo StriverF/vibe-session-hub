@@ -23,6 +23,8 @@ APP_OUTPUT=""
 DEV_PROJECT_ROOT=""
 UPDATE_WEB_LOGO=0
 SIGN_IDENTITY="${MACOS_SIGN_IDENTITY:--}"
+KEYCHAIN_PATH="${MACOS_KEYCHAIN_PATH:-}"
+ENTITLEMENTS_PLIST="$PROJECT_DIR/macos/entitlements.plist"
 
 usage() {
   cat <<'EOF'
@@ -40,6 +42,8 @@ Options:
   --dev-project-root <dir>  Write project_root.txt for local checkout dev mode (used by install.sh)
   --update-web-logo         Also regenerate static/icons/logo.png from logo-master.png
   --sign-identity <id>      codesign identity (default: "-" ad-hoc, or MACOS_SIGN_IDENTITY env)
+  --keychain <path>         Optional keychain path for Developer ID codesign (or MACOS_KEYCHAIN_PATH env)
+  --entitlements <path>     Entitlements plist for signing (default: macos/entitlements.plist)
   -h, --help                Show this help message
 EOF
 }
@@ -82,6 +86,14 @@ while [ $# -gt 0 ]; do
       SIGN_IDENTITY="$2"
       shift 2
       ;;
+    --keychain)
+      KEYCHAIN_PATH="$2"
+      shift 2
+      ;;
+    --entitlements)
+      ENTITLEMENTS_PLIST="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -102,6 +114,16 @@ fi
 if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9._-]+)?$ ]]; then
   echo "Error: invalid version '$VERSION' (expected semver like 1.0.0 or 1.2.0-rc.1)" >&2
   exit 2
+fi
+
+if [ ! -f "$ENTITLEMENTS_PLIST" ]; then
+  echo "Error: entitlements plist not found at '$ENTITLEMENTS_PLIST'" >&2
+  exit 2
+fi
+
+KEYCHAIN_ARGS=()
+if [ -n "$KEYCHAIN_PATH" ]; then
+  KEYCHAIN_ARGS+=(--keychain "$KEYCHAIN_PATH")
 fi
 
 # CFBundleVersion prefers dot-separated numeric components (strip prerelease suffix if any)
@@ -229,8 +251,12 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <string>AppIcon</string>
   <key>LSMinimumSystemVersion</key>
   <string>${MIN_MACOS}</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key>
   <true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Vibe Session Hub 需要发送 AppleEvent 以将深链精准投递至对应的 Claude、Cursor、Codex 等 AI 编程客户端窗口（Used to open session deep links in the target AI coding client）。</string>
   <key>VibeHubPort</key>
   <integer>${HUB_PORT}</integer>
   <key>NSAppTransportSecurity</key>
@@ -253,11 +279,35 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
+# Strip FinderInfo / quarantine / resource-fork detritus that can break codesign
+/usr/bin/xattr -cr "$APP_BUNDLE"
+
+# Sign inside-out (helper executable first, then outer .app bundle) without deprecated --deep
+HELPER_BIN="$APP_BUNDLE/Contents/MacOS/send_url_to_pid"
 if [ "$SIGN_IDENTITY" = "-" ]; then
-  /usr/bin/codesign --force --deep --sign - "$APP_BUNDLE"
+  /usr/bin/codesign --force --sign - \
+    --identifier "${BUNDLE_ID}.send-url-to-pid" \
+    --entitlements "$ENTITLEMENTS_PLIST" \
+    "$HELPER_BIN"
+  /usr/bin/codesign --force --sign - \
+    --entitlements "$ENTITLEMENTS_PLIST" \
+    "$APP_BUNDLE"
 else
-  /usr/bin/codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
+  /usr/bin/codesign --force --options runtime --timestamp \
+    ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} \
+    --sign "$SIGN_IDENTITY" \
+    --identifier "${BUNDLE_ID}.send-url-to-pid" \
+    --entitlements "$ENTITLEMENTS_PLIST" \
+    "$HELPER_BIN"
+  /usr/bin/codesign --force --options runtime --timestamp \
+    ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} \
+    --sign "$SIGN_IDENTITY" \
+    --entitlements "$ENTITLEMENTS_PLIST" \
+    "$APP_BUNDLE"
 fi
+
+/usr/bin/codesign --verify --strict --verbose=2 "$HELPER_BIN"
+/usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
 if [ "$APP_ONLY" -eq 1 ]; then
   echo "==> [4/4] Skipping DMG creation (--app-only)"
@@ -275,6 +325,12 @@ mkdir -p "$STAGE_DIR"
 /usr/bin/ditto "$APP_BUNDLE" "$STAGE_DIR/$APP_NAME.app"
 ln -s /Applications "$STAGE_DIR/Applications"
 
+if [ "$SIGN_IDENTITY" = "-" ]; then
+  FIRST_LAUNCH_NOTE=$'首次打开提示 / First Launch (Ad-hoc Signed Builds):\n如果 macOS 提示「无法验证开发者」或「已损坏」，请在终端执行以下命令后重试：\n  xattr -cr "/Applications/Vibe Session Hub.app"\n'
+else
+  FIRST_LAUNCH_NOTE=$'签名说明 / Code Signing:\n当前安装包已使用 Apple Developer ID 签名（开启 Hardened Runtime）。\nThis build is signed with an Apple Developer ID certificate (Hardened Runtime enabled).\n'
+fi
+
 cat > "$STAGE_DIR/安装说明-README.txt" <<EOF
 Vibe Session Hub v${VERSION} (macOS ${MIN_MACOS}+ ${ARCH_LABEL})
 ================================================================
@@ -287,10 +343,7 @@ Vibe Session Hub v${VERSION} (macOS ${MIN_MACOS}+ ${ARCH_LABEL})
 3. （可选）在顶部菜单栏点击「Vibe Session Hub -> 安装 / 更新开机后台服务」，
    即可在关闭窗口后继续保持后台增量索引与跨机跳转服务运行。
 
-首次打开提示 / First Launch (Ad-hoc Signed Builds):
-如果 macOS 提示「无法验证开发者」或「已损坏」，请在终端执行以下命令后重试：
-  xattr -cr "/Applications/Vibe Session Hub.app"
-
+${FIRST_LAUNCH_NOTE}
 自定义端口 / Custom Port:
 默认监听 127.0.0.1:${HUB_PORT}。如需修改端口，可在 ~/.vibe-session-hub/preferences.json
 中设置 {"port": 18380}，或通过环境变量 VIBE_HUB_PORT=18380 启动。
@@ -320,6 +373,15 @@ done
 if [ "$DMG_OK" -ne 1 ]; then
   echo "Error: failed to create DMG after 3 attempts" >&2
   exit 1
+fi
+
+if [ "$SIGN_IDENTITY" != "-" ]; then
+  echo "==> Signing DMG installer with Developer ID"
+  /usr/bin/codesign --force --timestamp \
+    ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} \
+    --sign "$SIGN_IDENTITY" \
+    "$DMG_PATH"
+  /usr/bin/codesign --verify --verbose=2 "$DMG_PATH"
 fi
 
 /usr/bin/hdiutil verify "$DMG_PATH"

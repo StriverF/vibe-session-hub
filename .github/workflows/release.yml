@@ -117,24 +117,40 @@ jobs:
           APPLE_SIGNING_CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          if [ -n "$APPLE_SIGNING_CERT_P12" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+          if [ -n "$APPLE_SIGNING_CERT_P12" ] || [ -n "$APPLE_SIGNING_IDENTITY" ] || [ -n "$APPLE_SIGNING_CERT_PASSWORD" ]; then
+            if [ -z "$APPLE_SIGNING_CERT_P12" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+              echo "Error: partial Apple signing secrets detected. Set both APPLE_SIGNING_CERT_P12 and APPLE_SIGNING_IDENTITY (plus APPLE_SIGNING_CERT_PASSWORD if the .p12 is password-protected)." >&2
+              exit 1
+            fi
+
             KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
             KEYCHAIN_PASS="$(uuidgen)"
             CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+            CLEAN_IDENTITY="$(printf '%s' "$APPLE_SIGNING_IDENTITY" | tr -d '\r\n')"
 
-            printf '%s' "$APPLE_SIGNING_CERT_P12" | base64 --decode > "$CERT_PATH"
+            printf '%s' "$APPLE_SIGNING_CERT_P12" | tr -d '\r\n ' | base64 --decode > "$CERT_PATH"
             security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
             security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
             security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
             security import "$CERT_PATH" -P "$APPLE_SIGNING_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-            security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
+            security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASS" "$KEYCHAIN_PATH"
             security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
+            security default-keychain -d user -s "$KEYCHAIN_PATH"
             rm -f "$CERT_PATH"
 
-            echo "identity=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_OUTPUT"
+            IDENTITIES="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH")"
+            echo "$IDENTITIES"
+            if ! printf '%s\n' "$IDENTITIES" | grep -Fiq "$CLEAN_IDENTITY"; then
+              echo "Error: signing identity '$CLEAN_IDENTITY' was not found as a valid codesigning identity in the imported .p12." >&2
+              exit 1
+            fi
+
+            echo "identity=$CLEAN_IDENTITY" >> "$GITHUB_OUTPUT"
+            echo "keychain_path=$KEYCHAIN_PATH" >> "$GITHUB_OUTPUT"
             echo "developer_id=true" >> "$GITHUB_OUTPUT"
           else
             echo "identity=-" >> "$GITHUB_OUTPUT"
+            echo "keychain_path=" >> "$GITHUB_OUTPUT"
             echo "developer_id=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -142,6 +158,7 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           MACOS_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          MACOS_KEYCHAIN_PATH: ${{ steps.signing.outputs.keychain_path }}
         run: |
           bash scripts/package_macos.sh \
             --version "$VERSION" \
@@ -157,13 +174,53 @@ jobs:
           APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          if [ -n "$APPLE_NOTARY_APPLE_ID" ] && [ -n "$APPLE_NOTARY_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+          if [ -n "$APPLE_NOTARY_APPLE_ID" ] || [ -n "$APPLE_NOTARY_PASSWORD" ] || [ -n "$APPLE_TEAM_ID" ]; then
+            if [ -z "$APPLE_NOTARY_APPLE_ID" ] || [ -z "$APPLE_NOTARY_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+              echo "Error: partial Apple notarization secrets detected. Set APPLE_NOTARY_APPLE_ID, APPLE_NOTARY_PASSWORD, and APPLE_TEAM_ID together." >&2
+              exit 1
+            fi
+
+            NOTARY_JSON="$RUNNER_TEMP/notary-result.json"
+            set +e
             xcrun notarytool submit "dist/$DMG_NAME" \
               --apple-id "$APPLE_NOTARY_APPLE_ID" \
               --password "$APPLE_NOTARY_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" \
-              --wait
+              --output-format json \
+              --wait > "$NOTARY_JSON"
+            SUBMIT_RC=$?
+            set -e
+
+            cat "$NOTARY_JSON"
+            read -r SUBMISSION_ID SUBMISSION_STATUS < <(
+              /usr/bin/python3 -c '
+          import json, sys
+          try:
+              with open(sys.argv[1], encoding="utf-8") as fh:
+                  data = json.load(fh)
+          except Exception:
+              print("- UNKNOWN")
+              sys.exit(0)
+          sid = str(data.get("id") or "-").strip() or "-"
+          status = str(data.get("status") or "UNKNOWN").strip() or "UNKNOWN"
+          print(f"{sid} {status}")
+          ' "$NOTARY_JSON"
+            )
+
+            if [ "$SUBMIT_RC" -ne 0 ] || [ "$SUBMISSION_STATUS" != "Accepted" ]; then
+              echo "Error: Apple notarization failed (exit=$SUBMIT_RC, status=$SUBMISSION_STATUS, id=$SUBMISSION_ID)" >&2
+              if [ -n "$SUBMISSION_ID" ] && [ "$SUBMISSION_ID" != "-" ]; then
+                echo "=== Apple Notary Log ($SUBMISSION_ID) ===" >&2
+                xcrun notarytool log "$SUBMISSION_ID" \
+                  --apple-id "$APPLE_NOTARY_APPLE_ID" \
+                  --password "$APPLE_NOTARY_PASSWORD" \
+                  --team-id "$APPLE_TEAM_ID" >&2 || true
+              fi
+              exit 1
+            fi
+
             xcrun stapler staple "dist/$DMG_NAME"
+            xcrun stapler validate "dist/$DMG_NAME"
             (cd dist && /usr/bin/shasum -a 256 "$DMG_NAME" > "${DMG_NAME}.sha256")
             echo "notarized=true" >> "$GITHUB_OUTPUT"
           else
@@ -174,6 +231,8 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
           DMG_NAME: ${{ steps.meta.outputs.dmg_name }}
+          DEVELOPER_ID: ${{ steps.signing.outputs.developer_id }}
+          NOTARIZED: ${{ steps.notary.outputs.notarized }}
         run: |
           MOUNT_DIR="$(mktemp -d)"
           TMP_STATE="$(mktemp -d)"
@@ -195,10 +254,28 @@ jobs:
 
           PLIST_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
           test "$PLIST_VER" = "$VERSION"
+          /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$APP/Contents/Info.plist" >/dev/null
 
           lipo -info "$APP/Contents/MacOS/VibeSessionHub" | grep -q "arm64"
           lipo -info "$APP/Contents/MacOS/VibeSessionHub" | grep -q "x86_64"
-          codesign --verify --deep --strict "$APP"
+          lipo -info "$APP/Contents/MacOS/send_url_to_pid" | grep -q "arm64"
+          lipo -info "$APP/Contents/MacOS/send_url_to_pid" | grep -q "x86_64"
+
+          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/send_url_to_pid"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
+          codesign -d --entitlements :- "$APP/Contents/MacOS/send_url_to_pid" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
+
+          if [ "$DEVELOPER_ID" = "true" ]; then
+            codesign --verify --verbose=2 "dist/$DMG_NAME"
+            codesign -dv "$APP" 2>&1 | grep -q "runtime"
+            codesign -dv "$APP/Contents/MacOS/send_url_to_pid" 2>&1 | grep -q "runtime"
+          fi
+
+          if [ "$NOTARIZED" = "true" ]; then
+            spctl --assess --type execute --verbose=4 "$APP"
+            spctl --assess --type open --context context:primary-signature --verbose=4 "dist/$DMG_NAME"
+          fi
 
           # Verify embedded Python backend runs cleanly directly from the read-only DMG mount
           (
@@ -286,3 +363,11 @@ jobs:
             dist/${{ steps.meta.outputs.dmg_name }}.sha256
             dist/release-notes.md
           retention-days: 14
+
+      - name: Clean up temporary signing keychain
+        if: always() && steps.signing.outputs.keychain_path != ''
+        env:
+          KEYCHAIN_PATH: ${{ steps.signing.outputs.keychain_path }}
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || rm -f "$KEYCHAIN_PATH"
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-result.json"

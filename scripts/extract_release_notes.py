@@ -92,7 +92,14 @@ def build_release_notes(
         "4. 如需在关闭窗口后保持后台增量索引与跨机跳转服务运行，点击顶部菜单栏 **`Vibe Session Hub → 安装 / 更新开机后台服务`**。",
     ]
 
-    if not signed_notarized:
+    if signed_notarized:
+        install_lines.extend(
+            [
+                "",
+                "> **安全认证**：当前安装包已使用 Apple Developer ID 签名并通过 Apple 官方公证（Notarized），下载后可直接双击安装运行。",
+            ]
+        )
+    else:
         install_lines.extend(
             [
                 "",

@@ -671,6 +671,33 @@ class TestP2PathValidationAndCustomPort(unittest.TestCase):
             self.assertIn("xattr -cr", notes)
             self.assertIn("deadbeef", notes)
 
+            notarized_notes = mod.build_release_notes(
+                version="1.2.0",
+                tag="v1.2.0",
+                changelog_path=cl,
+                dmg_name="Vibe-Session-Hub-v1.2.0-macos-universal.dmg",
+                sha256_line="deadbeef  Vibe-Session-Hub-v1.2.0-macos-universal.dmg",
+                signed_notarized=True,
+            )
+            self.assertNotIn("xattr -cr", notarized_notes)
+            self.assertIn("Apple Developer ID", notarized_notes)
+
+    def test_macos_entitlements_and_packaging_signing_hardening(self) -> None:
+        import plistlib
+
+        repo_root = Path(__file__).resolve().parent.parent
+        ent_path = repo_root / "macos" / "entitlements.plist"
+        self.assertTrue(ent_path.is_file(), "macos/entitlements.plist must exist")
+        with ent_path.open("rb") as fh:
+            ent = plistlib.load(fh)
+        self.assertIs(ent.get("com.apple.security.automation.apple-events"), True)
+
+        pkg_script = (repo_root / "scripts" / "package_macos.sh").read_text(encoding="utf-8")
+        self.assertIn("NSAppleEventsUsageDescription", pkg_script)
+        self.assertIn("--entitlements", pkg_script)
+        self.assertNotIn("codesign --force --deep", pkg_script)
+        self.assertIn('"$DMG_PATH"', pkg_script)
+
 
 if __name__ == "__main__":
     unittest.main()
