@@ -26,6 +26,7 @@
       </div>
       <div class="topbar-actions">
         <span id="syncMeta" class="sync-meta">正在读取索引…</span>
+        <div id="updateControl" class="update-control" aria-live="polite"></div>
         <button id="openThemeModalBtn" class="btn btn-ghost" title="切换配色主题">
           <span class="theme-swatch-dot" aria-hidden="true"></span>
           <span>配色主题</span>
@@ -69,6 +70,32 @@
         <div class="empty-detail">选择左侧任意会话查看上下文与跨机跳转操作</div>
       </aside>
     </main>
+  </div>
+
+  <!-- 软件更新与更新内容面板 -->
+  <div id="updateModal" class="modal-backdrop hidden">
+    <div class="modal-card modal-card-wide" role="dialog" aria-modal="true" aria-labelledby="updateModalTitle">
+      <div class="modal-header">
+        <div>
+          <h2 id="updateModalTitle">软件更新</h2>
+          <p id="updateModalSubtitle" class="modal-subtitle">当前版本 —</p>
+        </div>
+        <button id="closeUpdateModalBtn" class="icon-close" aria-label="关闭">✕</button>
+      </div>
+
+      <div id="updateStatusCard" class="update-status-card"></div>
+
+      <div class="update-notes-header">
+        <span class="appearance-heading">更新内容</span>
+        <button type="button" id="updateToggleAllNotesBtn" class="update-link-btn hidden">查看全部版本</button>
+      </div>
+      <div id="updateChangelogList" class="update-changelog-list"></div>
+
+      <div class="modal-footer">
+        <button type="button" id="openReleasePageBtn" class="btn btn-ghost">GitHub 发布页</button>
+        <button type="button" id="doneUpdateModalBtn" class="btn btn-primary">关闭</button>
+      </div>
+    </div>
   </div>
 
   <!-- 配色主题选择面板 -->

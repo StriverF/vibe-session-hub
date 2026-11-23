@@ -158,9 +158,12 @@ vibe-session-hub/
 │   ├── storage.py             # WAL 数据库连接/Schema 管理与存储协调门面（SessionHubStore）
 │   ├── git_pr_resolver.py     # 本地 git log 提交历史与 gh CLI 远端 PR 分支反查器
 │   ├── launcher.py            # 基于工具注册表与策略分发表的原生 Deep-Link 安全唤起逻辑
+│   ├── updater.py             # GitHub Releases 版本检查、校验规则与 CHANGELOG 解析器（浏览器模式回退）
 │   └── server.py              # 本地 HTTP API、加固静态 ES 模块服务与后台定时增量同步守护线程
 ├── macos/
-│   ├── VibeSessionHub.swift   # 原生 macOS AppKit + WKWebView 桌面容器、自定义端口透传与独立运行支持
+│   ├── VibeSessionHub.swift   # 原生 macOS AppKit + WKWebView 桌面容器、自动升级旧后台服务与独立运行支持
+│   ├── AppUpdater.swift       # 原生应用内版本检查、DMG 下载校验、安全静默替换与重启更新引擎
+│   ├── BackendUpgradeLogic.swift # 后端版本/路径/构建标识校验、发布源解析与 LaunchAgent 自动升级决策模块
 │   ├── build_icon.swift       # 自动生成全尺寸 macOS AppIcon.icns 与高清图标
 │   ├── entitlements.plist     # Hardened Runtime 最小权限集（AppleEvents 精准投递深链）
 │   └── send_url_to_pid.swift  # 按指定进程 PID 精准投递 AppleEvent GURL 深链

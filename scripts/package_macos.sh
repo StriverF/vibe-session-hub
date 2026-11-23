@@ -158,23 +158,21 @@ cleanup() {
 trap cleanup EXIT
 
 compile_swift_binary() {
-  local src="$1"
-  local out="$2"
-  shift 2
-  local frameworks=("$@")
+  local out="$1"
+  shift
 
   if [ "$ARCH" = "universal" ]; then
     local out_arm="$WORK_DIR/$(basename "$out").arm64"
     local out_x86="$WORK_DIR/$(basename "$out").x86_64"
-    /usr/bin/swiftc -O -target "arm64-apple-macos${MIN_MACOS}" "${frameworks[@]}" "$src" -o "$out_arm"
-    /usr/bin/swiftc -O -target "x86_64-apple-macos${MIN_MACOS}" "${frameworks[@]}" "$src" -o "$out_x86"
+    /usr/bin/swiftc -O -target "arm64-apple-macos${MIN_MACOS}" "$@" -o "$out_arm"
+    /usr/bin/swiftc -O -target "x86_64-apple-macos${MIN_MACOS}" "$@" -o "$out_x86"
     /usr/bin/lipo -create "$out_arm" "$out_x86" -output "$out"
   elif [ "$ARCH" = "arm64" ]; then
-    /usr/bin/swiftc -O -target "arm64-apple-macos${MIN_MACOS}" "${frameworks[@]}" "$src" -o "$out"
+    /usr/bin/swiftc -O -target "arm64-apple-macos${MIN_MACOS}" "$@" -o "$out"
   elif [ "$ARCH" = "x86_64" ]; then
-    /usr/bin/swiftc -O -target "x86_64-apple-macos${MIN_MACOS}" "${frameworks[@]}" "$src" -o "$out"
+    /usr/bin/swiftc -O -target "x86_64-apple-macos${MIN_MACOS}" "$@" -o "$out"
   else
-    /usr/bin/swiftc -O "${frameworks[@]}" "$src" -o "$out"
+    /usr/bin/swiftc -O "$@" -o "$out"
   fi
 }
 
@@ -195,8 +193,8 @@ echo "==> [2/4] Compiling macOS native binaries (${ARCH_LABEL}, min macOS ${MIN_
 SEND_URL_BIN="$WORK_DIR/send_url_to_pid"
 APP_MAIN_BIN="$WORK_DIR/VibeSessionHub"
 
-compile_swift_binary "$PROJECT_DIR/macos/send_url_to_pid.swift" "$SEND_URL_BIN" -framework AppKit -framework CoreServices
-compile_swift_binary "$PROJECT_DIR/macos/VibeSessionHub.swift" "$APP_MAIN_BIN" -framework AppKit -framework WebKit
+compile_swift_binary "$SEND_URL_BIN" -framework AppKit -framework CoreServices "$PROJECT_DIR/macos/send_url_to_pid.swift"
+compile_swift_binary "$APP_MAIN_BIN" -framework AppKit -framework WebKit "$PROJECT_DIR/macos/BackendUpgradeLogic.swift" "$PROJECT_DIR/macos/AppUpdater.swift" "$PROJECT_DIR/macos/VibeSessionHub.swift"
 
 echo "==> [3/4] Assembling standalone app bundle: $APP_BUNDLE"
 rm -rf "$APP_BUNDLE"
@@ -223,6 +221,12 @@ cp "$ICNS_PATH" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
   "$PROJECT_DIR/static/" "$APP_BUNDLE/Contents/Resources/app/static/"
 
 printf '%s\n' "$VERSION" > "$APP_BUNDLE/Contents/Resources/app/VERSION"
+if [ -f "$PROJECT_DIR/CHANGELOG.md" ]; then
+  cp "$PROJECT_DIR/CHANGELOG.md" "$APP_BUNDLE/Contents/Resources/app/CHANGELOG.md"
+fi
+GIT_SHORT_SHA="$(git -C "$PROJECT_DIR" rev-parse --short=7 HEAD 2>/dev/null || echo "nogit")"
+BUILD_ID="${VERSION}-${GIT_SHORT_SHA}-$(date -u +%Y%m%d%H%M%S)"
+printf '%s\n' "$BUILD_ID" > "$APP_BUNDLE/Contents/Resources/app/BUILD_ID"
 
 if [ -n "$DEV_PROJECT_ROOT" ]; then
   printf '%s\n' "$DEV_PROJECT_ROOT" > "$APP_BUNDLE/Contents/Resources/project_root.txt"

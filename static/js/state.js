@@ -129,6 +129,10 @@ export const state = {
   selectedIndex: 0,
   searchTimer: null,
   serverBaseUrl: "",
+  serverVersion: "",
+  updateInfo: null,
+  changelogEntries: [],
+  updateModalScope: "all",
   theme: document.documentElement.dataset.theme || "prism-aurora",
 };
 
@@ -171,6 +175,15 @@ export function canOpenRemoteDirectly(item) {
 }
 
 export const els = {
+  updateControl: document.getElementById("updateControl"),
+  updateModal: document.getElementById("updateModal"),
+  updateModalSubtitle: document.getElementById("updateModalSubtitle"),
+  closeUpdateModalBtn: document.getElementById("closeUpdateModalBtn"),
+  doneUpdateModalBtn: document.getElementById("doneUpdateModalBtn"),
+  openReleasePageBtn: document.getElementById("openReleasePageBtn"),
+  updateStatusCard: document.getElementById("updateStatusCard"),
+  updateToggleAllNotesBtn: document.getElementById("updateToggleAllNotesBtn"),
+  updateChangelogList: document.getElementById("updateChangelogList"),
   openThemeModalBtn: document.getElementById("openThemeModalBtn"),
   appearanceModal: document.getElementById("appearanceModal"),
   closeAppearanceBtn: document.getElementById("closeAppearanceBtn"),

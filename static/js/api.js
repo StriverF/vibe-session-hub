@@ -59,3 +59,18 @@ export function openSession(uid) {
 export function addManualLink(payload) {
   return postApi("/api/manual-link", payload);
 }
+
+export async function fetchUpdateStatus() {
+  const res = await fetch("/api/update/status", { cache: "no-store" });
+  return res.json();
+}
+
+export function triggerUpdateCheck() {
+  return postApi("/api/update/check", {});
+}
+
+export async function fetchChangelog() {
+  const res = await fetch("/api/update/changelog", { cache: "no-store" });
+  return res.json();
+}
+

@@ -22,6 +22,12 @@ import {
   renderAppearanceOptions,
   selectTheme,
 } from "./theme.js";
+import {
+  bindUpdaterEvents,
+  closeUpdateModal,
+  initUpdater,
+  renderUpdateControl,
+} from "./updater.js";
 import { buildCrossMacJumpUrl, showToast } from "./utils.js";
 
 async function loadFacets() {
@@ -29,6 +35,10 @@ async function loadFacets() {
   state.facets = data;
   if (data.server?.base_url) {
     state.serverBaseUrl = data.server.base_url;
+  }
+  if (data.server?.version) {
+    state.serverVersion = data.server.version;
+    renderUpdateControl();
   }
   if (data.tool_catalog) {
     updateToolCatalog(data.tool_catalog);
@@ -109,6 +119,7 @@ function closeLinkModal() {
 }
 
 function bindEvents() {
+  bindUpdaterEvents();
   els.openThemeModalBtn.addEventListener("click", openAppearanceModal);
   els.closeAppearanceBtn.addEventListener("click", closeAppearanceModal);
   els.doneAppearanceBtn.addEventListener("click", closeAppearanceModal);
@@ -233,6 +244,10 @@ function bindEvents() {
       els.searchInput.select();
       return;
     }
+    if (els.updateModal && !els.updateModal.classList.contains("hidden")) {
+      if (e.key === "Escape") closeUpdateModal();
+      return;
+    }
     if (!els.appearanceModal.classList.contains("hidden")) {
       if (e.key === "Escape") closeAppearanceModal();
       return;
@@ -280,6 +295,7 @@ async function init() {
   renderAppearanceOptions();
   renderManualLinkToolOptions();
   bindEvents();
+  initUpdater();
   await loadFacets();
   await runSearch(false);
   els.searchInput.focus();
