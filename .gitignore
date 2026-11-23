@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS & compiled binaries
+.DS_Store
+macos/bin/
+*.app/
+*.iconset/
+
+# Local IDE / agent configs
+.claude/
+.vscode/
+.idea/
+.env

@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="obsidian-amber">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vibe Session Hub</title>
+  <link rel="icon" type="image/png" href="/icons/logo.png" />
+  <script>
+    try {
+      const savedTheme = localStorage.getItem("vibe_hub_theme");
+      if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+    } catch (_) {}
+  </script>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <img class="brand-logo" src="/icons/logo.png" alt="Vibe Session Hub" />
+        <span class="brand-name">Vibe Session Hub</span>
+        <button id="machineBadgeBtn" class="machine-chip" title="点击修改当前电脑显示名称">
+          <span class="status-dot"></span>
+          <span id="currentMachineName">加载中…</span>
+        </button>
+      </div>
+      <div class="topbar-actions">
+        <span id="syncMeta" class="sync-meta">正在读取索引…</span>
+        <button id="openThemeModalBtn" class="btn btn-ghost" title="切换配色主题">
+          <span class="theme-swatch-dot" aria-hidden="true"></span>
+          <span>配色主题</span>
+        </button>
+        <button id="openLinkModalBtn" class="btn btn-ghost">+ 关联 PR / 网页会话</button>
+        <button id="syncNowBtn" class="btn btn-secondary">同步索引</button>
+      </div>
+    </header>
+
+    <section class="search-section">
+      <div class="search-box">
+        <svg class="search-icon" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+          <path d="M13.5 13.5L17.5 17.5M15.5 9C15.5 12.5899 12.5899 15.5 9 15.5C5.41015 15.5 2.5 12.5899 2.5 9C2.5 5.41015 5.41015 2.5 9 2.5C12.5899 2.5 15.5 5.41015 15.5 9Z" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>
+        </svg>
+        <input
+          id="searchInput"
+          type="search"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="输入 PR 编号（如 5590、#6306）、Git 分支名、报错或业务关键词…  (⌘K 聚焦，↑↓ 选择，↵ 打开/复制)"
+        />
+        <button id="clearSearchBtn" class="clear-btn hidden" title="清空 (Esc)">✕</button>
+      </div>
+
+      <div class="filters-bar">
+        <div id="machineFilters" class="pill-group"></div>
+        <div class="divider-v"></div>
+        <div id="toolFilters" class="pill-group"></div>
+        <label class="pr-toggle">
+          <input id="onlyPrCheckbox" type="checkbox" />
+          <span>仅看含 PR (<span id="prTotalCount">0</span>)</span>
+        </label>
+      </div>
+
+      <div id="prBanner" class="pr-banner hidden"></div>
+    </section>
+
+    <main class="workspace">
+      <section id="resultsList" class="results-list" aria-label="会话列表"></section>
+      <aside id="detailPane" class="detail-pane" aria-label="会话详情">
+        <div class="empty-detail">选择左侧任意会话查看上下文与跨机跳转操作</div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- 配色主题选择面板 -->
+  <div id="appearanceModal" class="modal-backdrop hidden">
+    <div class="modal-card modal-card-wide" role="dialog" aria-modal="true" aria-labelledby="appearanceModalTitle">
+      <div class="modal-header">
+        <div>
+          <h2 id="appearanceModalTitle">配色主题</h2>
+          <p class="modal-subtitle">实时预览切换 8 款界面配色方案</p>
+        </div>
+        <button id="closeAppearanceBtn" class="icon-close" aria-label="关闭">✕</button>
+      </div>
+
+      <div class="appearance-section">
+        <div id="themeGrid" class="theme-grid"></div>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" id="doneAppearanceBtn" class="btn btn-primary">完成</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 关联 PR / 网页会话面板 -->
+  <div id="linkModal" class="modal-backdrop hidden">
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="modal-header">
+        <h2 id="modalTitle">关联 PR 编号 / 登记外部网页会话</h2>
+        <button id="closeModalBtn" class="icon-close">✕</button>
+      </div>
+      <form id="manualLinkForm" class="modal-body">
+        <input type="hidden" id="linkTargetUid" />
+        <div id="linkTargetHint" class="target-hint hidden"></div>
+
+        <div class="field-row">
+          <label>PR 编号（选填，纯数字如 6306）</label>
+          <input id="linkPrNumber" type="text" placeholder="例如 6306" />
+        </div>
+
+        <div class="field-row" id="standaloneFields">
+          <label>所属工具（登记网页端或手动补充会话时使用）</label>
+          <select id="linkToolSelect">
+            <option value="gemini-web">Gemini 网页版</option>
+            <option value="grok-web">Grok 网页版</option>
+            <option value="chatgpt-web">ChatGPT 网页版</option>
+            <option value="cursor">Cursor</option>
+            <option value="gemini">Gemini 桌面端</option>
+            <option value="web-link">其他链接</option>
+          </select>
+        </div>
+
+        <div class="field-row">
+          <label>网页会话 URL（选填，点击结果时将直接打开该网址）</label>
+          <input id="linkExternalUrl" type="url" placeholder="https://gemini.google.com/app/..." />
+        </div>
+
+        <div class="field-row" id="standaloneTitleField">
+          <label>会话标题 / 问题简述（选填，绑定已有会话时也可覆盖标题）</label>
+          <input id="linkTitle" type="text" placeholder="例如：修复 meta-ads 断连时暂停结算" />
+        </div>
+
+        <div class="field-row">
+          <label>备注关键词（选填，方便日后按关键词搜索）</label>
+          <textarea id="linkNote" rows="2" placeholder="补充模块名、分支名或待确认问题…"></textarea>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" id="cancelModalBtn" class="btn btn-ghost">取消</button>
+          <button type="submit" class="btn btn-primary">保存并同步到 iCloud</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
