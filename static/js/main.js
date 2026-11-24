@@ -21,6 +21,7 @@ import {
   openAppearanceModal,
   renderAppearanceOptions,
   selectTheme,
+  syncNativeWindowAppearance,
 } from "./theme.js";
 import {
   bindUpdaterEvents,
@@ -291,7 +292,97 @@ function bindEvents() {
   });
 }
 
+const NATIVE_NO_DRAG_SELECTOR =
+  'button, a, input, select, textarea, label, [role="button"], [contenteditable="true"], [data-no-drag]';
+
+function initNativeWindowChrome() {
+  const handler = window.webkit?.messageHandlers?.vibeHubWindow;
+  if (!window.__VIBE_HUB_NATIVE__ || !handler) return;
+
+  const post = (payload) => {
+    try {
+      handler.postMessage(payload);
+    } catch (_) {}
+  };
+
+  const applyMetrics = (metrics) => {
+    if (!metrics || typeof metrics !== "object") return;
+    const root = document.documentElement;
+    root.classList.add("native-macos");
+    root.classList.toggle("native-fullscreen", Boolean(metrics.isFullScreen));
+    if (typeof metrics.leftInset === "number") {
+      root.style.setProperty("--native-titlebar-left", `${metrics.leftInset}px`);
+    }
+    if (typeof metrics.height === "number") {
+      root.style.setProperty("--native-titlebar-height", `${metrics.height}px`);
+    }
+  };
+
+  window.__vibeHubReceiveWindowMetrics = applyMetrics;
+  if (window.__VIBE_HUB_NATIVE_METRICS__) {
+    applyMetrics(window.__VIBE_HUB_NATIVE_METRICS__);
+  }
+  post({ action: "requestMetrics" });
+  syncNativeWindowAppearance(state.theme);
+
+  const topbar = document.querySelector(".topbar");
+  if (!topbar) return;
+
+  let dragCleanup = null;
+  const clearPendingDrag = () => {
+    if (dragCleanup) {
+      dragCleanup();
+      dragCleanup = null;
+    }
+  };
+
+  topbar.addEventListener("dragstart", (e) => {
+    e.preventDefault();
+  });
+
+  topbar.addEventListener("mousedown", (e) => {
+    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.target instanceof Element && e.target.closest(NATIVE_NO_DRAG_SELECTOR)) {
+      return;
+    }
+    e.preventDefault();
+    clearPendingDrag();
+
+    if (e.detail === 2) {
+      post({ action: "doubleClickTitlebar" });
+      return;
+    }
+    if (e.detail !== 1) return;
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const onMove = (ev) => {
+      if ((ev.buttons & 1) !== 1) {
+        clearPendingDrag();
+        return;
+      }
+      if (Math.hypot(ev.clientX - startX, ev.clientY - startY) >= 3) {
+        clearPendingDrag();
+        post({ action: "startDrag" });
+      }
+    };
+    const onCancel = () => clearPendingDrag();
+
+    window.addEventListener("mousemove", onMove, true);
+    window.addEventListener("mouseup", onCancel, true);
+    window.addEventListener("blur", onCancel);
+    window.addEventListener("contextmenu", onCancel, true);
+    dragCleanup = () => {
+      window.removeEventListener("mousemove", onMove, true);
+      window.removeEventListener("mouseup", onCancel, true);
+      window.removeEventListener("blur", onCancel);
+      window.removeEventListener("contextmenu", onCancel, true);
+    };
+  });
+}
+
 async function init() {
+  initNativeWindowChrome();
   renderAppearanceOptions();
   renderManualLinkToolOptions();
   bindEvents();
