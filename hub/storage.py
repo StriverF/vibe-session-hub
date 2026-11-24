@@ -168,9 +168,8 @@ class _ReadConnectionPool:
     def close(self) -> None:
         with self._lock:
             self._closed = True
-            conns = list(self._idle) + list(self._in_use)
+            conns = list(self._idle)
             self._idle.clear()
-            self._in_use.clear()
         for conn in conns:
             try:
                 conn.close()

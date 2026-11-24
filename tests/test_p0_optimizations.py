@@ -912,6 +912,100 @@ class TestP0ConcurrencyAndCaching(IsolatedHubTestCase):
         finally:
             store.close()
 
+    def test_read_pool_close_defers_in_use_connection_until_release(self) -> None:
+        seed = [_make_session("mac-local01", "s1", "关闭连接池时在途读连接回归测试")]
+        real_connect = storage_mod.sqlite3.connect
+        conn_lock = threading.Lock()
+        open_conns = 0
+
+        class _CountingConnection(sqlite3.Connection):
+            def close(self) -> None:
+                nonlocal open_conns
+                with conn_lock:
+                    self._close_calls = getattr(self, "_close_calls", 0) + 1
+                    if not getattr(self, "_tracked_closed", False):
+                        self._tracked_closed = True
+                        open_conns -= 1
+                super().close()
+
+        def tracked_connect(*args, **kwargs):
+            nonlocal open_conns
+            kwargs.setdefault("factory", _CountingConnection)
+            c = real_connect(*args, **kwargs)
+            c._tracked_closed = False
+            c._close_calls = 0
+            with conn_lock:
+                open_conns += 1
+            return c
+
+        with mock.patch.object(storage_mod.sqlite3, "connect", side_effect=tracked_connect):
+            store = storage_mod.SessionHubStore(local_only=True, read_pool_size=2)
+            with mock.patch.object(
+                storage_mod, "collect_all_local_sessions", return_value=seed
+            ):
+                store.sync_now(force_local=True)
+
+            entered = threading.Event()
+            allow_finish = threading.Event()
+            worker_counts: list[int] = []
+            worker_conn: list[sqlite3.Connection] = []
+            worker_errors: list[Exception] = []
+
+            def reader_worker() -> None:
+                try:
+                    with store._read_conn() as conn:
+                        worker_conn.append(conn)
+                        c1 = conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
+                        worker_counts.append(c1)
+                        entered.set()
+                        assert allow_finish.wait(timeout=5.0)
+                        # Second query after store.close() must still succeed on the borrowed conn
+                        c2 = conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
+                        worker_counts.append(c2)
+                except Exception as exc:
+                    worker_errors.append(exc)
+                    entered.set()
+
+            t = threading.Thread(target=reader_worker)
+            t.start()
+            try:
+                self.assertTrue(entered.wait(timeout=5.0))
+
+                # Ensure there is also an idle connection in the pool alongside the in-use worker connection
+                with store._read_conn() as extra_conn:
+                    self.assertEqual(
+                        extra_conn.execute("SELECT count(*) FROM sessions").fetchone()[0], 1
+                    )
+                self.assertEqual(store.read_pool_stats()["idle"], 1)
+                self.assertEqual(store.read_pool_stats()["in_use"], 1)
+
+                # Close store while reader_worker is still mid-block
+                store.close()
+
+                # Idle connection is closed immediately; in-use connection remains open until released
+                self.assertEqual(store.read_pool_stats()["idle"], 0)
+                self.assertEqual(store.read_pool_stats()["in_use"], 1)
+                self.assertEqual(len(worker_conn), 1)
+                self.assertEqual(worker_conn[0]._close_calls, 0)
+                self.assertEqual(open_conns, 1)
+
+                # New checkouts are rejected immediately after close()
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    with store._read_conn():
+                        pass
+            finally:
+                allow_finish.set()
+                t.join(timeout=5.0)
+                store.close()
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(worker_counts, [1, 1])
+        self.assertEqual(store.read_pool_stats()["in_use"], 0)
+        self.assertEqual(store.read_pool_stats()["idle"], 0)
+        self.assertEqual(worker_conn[0]._close_calls, 1)
+        self.assertEqual(open_conns, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
