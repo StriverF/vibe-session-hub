@@ -2,6 +2,7 @@ import Foundation
 
 let defaultHubPort = 17380
 let launchAgentLabel = "com.vibesessionhub.app"
+let launchAgentSoftFileLimit = 4096
 
 func parseValidPort(_ raw: Any?) -> Int? {
     if let intVal = raw as? Int, (1...65535).contains(intVal) {
@@ -316,6 +317,9 @@ func buildLaunchAgentPlist(
         "EnvironmentVariables": envVars,
         "RunAtLoad": true,
         "KeepAlive": true,
+        "SoftResourceLimits": [
+            "NumberOfFiles": launchAgentSoftFileLimit,
+        ],
         "StandardOutPath": stateDir.appendingPathComponent("server.log").path,
         "StandardErrorPath": stateDir.appendingPathComponent("server.err.log").path,
     ]

@@ -190,6 +190,8 @@ def _render_jump_html(
 class HubHTTPServer(ThreadingHTTPServer):
     """ThreadingHTTPServer carrying an injected SessionHubStore instance."""
 
+    request_queue_size = 64
+
     def __init__(
         self,
         server_address: tuple[str, int],
@@ -626,9 +628,34 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _raise_nofile_soft_limit(min_soft: int = 4096) -> None:
+    """Best-effort raise of RLIMIT_NOFILE soft limit (e.g. macOS launchd defaults to 256)."""
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:
+        return
+    if soft >= min_soft:
+        return
+    target = (
+        min_soft
+        if hard == resource.RLIM_INFINITY
+        else min(min_soft, hard)
+    )
+    if target <= soft:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        logger.debug("Raised RLIMIT_NOFILE soft limit from %d to %d", soft, target)
+    except Exception as exc:
+        logger.debug("Could not raise RLIMIT_NOFILE soft limit: %s", exc)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
     configure_logging(verbose=args.verbose)
+    _raise_nofile_soft_limit()
 
     store = SessionHubStore(local_only=args.local_only)
     info = store.sync_now(force_local=True)

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import sqlite3
 import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from . import config as _config_mod
 from .collectors import FileParseCache, collect_all_local_sessions
@@ -52,6 +53,7 @@ from .sync_mirror import (
 logger = logging.getLogger("vibe_session_hub.storage")
 
 SCHEMA_VERSION = "2"
+DEFAULT_READ_POOL_SIZE = 8
 
 
 def _configure_sqlite_conn(conn: sqlite3.Connection, readonly: bool = False) -> None:
@@ -65,6 +67,116 @@ def _configure_sqlite_conn(conn: sqlite3.Connection, readonly: bool = False) -> 
         conn.execute("PRAGMA synchronous=NORMAL")
 
 
+class _ReadConnectionPool:
+    """Bounded, non-blocking pool of read-only SQLite WAL connections.
+
+    Each checked-out connection is exclusively owned by a single caller for the
+    duration of its context manager block, then returned to the idle pool (or
+    closed immediately when the idle pool is already at capacity). Because
+    checkouts never block on pool exhaustion, re-entrant reads and burst
+    concurrency cannot deadlock while steady-state open FDs stay strictly bounded.
+    """
+
+    def __init__(self, db_path: Path, max_idle: int = DEFAULT_READ_POOL_SIZE) -> None:
+        self._db_path = Path(db_path)
+        self._max_idle = max(0, int(max_idle))
+        self._lock = threading.Lock()
+        self._idle: list[sqlite3.Connection] = []
+        self._in_use: set[sqlite3.Connection] = set()
+        self._closed = False
+
+    def _open_conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            str(self._db_path),
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        try:
+            _configure_sqlite_conn(conn, readonly=True)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        return conn
+
+    def acquire(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed store.")
+            conn = self._idle.pop() if self._idle else None
+            if conn is not None:
+                self._in_use.add(conn)
+                return conn
+
+        conn = self._open_conn()
+        with self._lock:
+            if self._closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise sqlite3.ProgrammingError("Cannot operate on a closed store.")
+            self._in_use.add(conn)
+            return conn
+
+    def release(self, conn: sqlite3.Connection, *, broken: bool = False) -> None:
+        should_close = broken
+        if not should_close:
+            try:
+                if conn.in_transaction:
+                    conn.rollback()
+            except Exception:
+                should_close = True
+
+        with self._lock:
+            self._in_use.discard(conn)
+            if (
+                not should_close
+                and not self._closed
+                and len(self._idle) < self._max_idle
+            ):
+                self._idle.append(conn)
+                return
+
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    @contextlib.contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        conn = self.acquire()
+        broken = False
+        try:
+            yield conn
+        except sqlite3.Error:
+            broken = True
+            raise
+        finally:
+            self.release(conn, broken=broken)
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "idle": len(self._idle),
+                "in_use": len(self._in_use),
+                "max_idle": self._max_idle,
+            }
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            conns = list(self._idle)
+            self._idle.clear()
+        for conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 class SessionHubStore:
     """Coordinator facade combining SQLite WAL storage, iCloud mirroring, shard ingestion, and search."""
 
@@ -73,6 +185,7 @@ class SessionHubStore:
         local_only: bool = False,
         db_path: Path | None = None,
         paths: HubPaths | None = None,
+        read_pool_size: int = DEFAULT_READ_POOL_SIZE,
     ) -> None:
         self.local_only = local_only
         self._has_explicit_paths = paths is not None
@@ -108,9 +221,14 @@ class SessionHubStore:
         # Serializes sync/ingestion pipelines without ever blocking HTTP readers.
         self._sync_lock = threading.Lock()
 
-        self._read_local = threading.local()
-        self._read_conns_lock = threading.Lock()
-        self._read_conns: list[sqlite3.Connection] = []
+        self._closed = False
+        self._read_pool = _ReadConnectionPool(
+            self.db_path, max_idle=read_pool_size
+        )
+        self._legacy_read_lock = threading.Lock()
+        self._legacy_read_conns: dict[
+            int, tuple[threading.Thread, sqlite3.Connection]
+        ] = {}
 
         self._last_local_scan_ms = 0
 
@@ -128,12 +246,14 @@ class SessionHubStore:
         self._ingestor = ShardIngestor(
             paths=self.paths,
             get_read_conn=self._get_read_conn,
+            acquire_read_conn=self._read_conn,
             write_conn=self._write_conn,
             db_write_lock=self._db_write_lock,
             parse_node_shard_fn=lambda p: self._parse_node_shard(p),
         )
         self._search_engine = SearchEngine(
             get_read_conn=self._get_read_conn,
+            acquire_read_conn=self._read_conn,
             write_conn=self._write_conn,
             db_write_lock=self._db_write_lock,
             get_machine_info_fn=self._get_machine_info,
@@ -166,26 +286,78 @@ class SessionHubStore:
             return get_machine_info(machine_file=self.paths.machine_file)
         return get_machine_info()
 
+    def _read_conn(self) -> contextlib.AbstractContextManager[sqlite3.Connection]:
+        return self._read_pool.connection()
+
+    def read_pool_stats(self) -> dict[str, int]:
+        return self._read_pool.stats()
+
     def _get_read_conn(self) -> sqlite3.Connection:
-        conn: sqlite3.Connection | None = getattr(self._read_local, "conn", None)
-        if conn is not None:
-            return conn
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        _configure_sqlite_conn(conn, readonly=True)
-        self._read_local.conn = conn
-        with self._read_conns_lock:
-            self._read_conns.append(conn)
+        """Legacy per-thread read connection accessor (kept for test compatibility).
+
+        Connections created for short-lived threads are pruned and closed once
+        their owning thread exits; internal callers should prefer `_read_conn()`.
+        """
+        current = threading.current_thread()
+        tid = current.ident if current.ident is not None else id(current)
+        with self._legacy_read_lock:
+            if self._closed:
+                raise sqlite3.ProgrammingError("Cannot operate on a closed store.")
+            dead_keys = [
+                k
+                for k, (th, _) in self._legacy_read_conns.items()
+                if not th.is_alive()
+            ]
+            dead_conns = [self._legacy_read_conns.pop(k)[1] for k in dead_keys]
+            existing = self._legacy_read_conns.get(tid)
+        for dc in dead_conns:
+            try:
+                dc.close()
+            except Exception:
+                pass
+        if existing is not None and existing[0] is current:
+            return existing[1]
+
+        conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            isolation_level=None,
+        )
+        try:
+            _configure_sqlite_conn(conn, readonly=True)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        with self._legacy_read_lock:
+            if self._closed:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                raise sqlite3.ProgrammingError("Cannot operate on a closed store.")
+            prev = self._legacy_read_conns.get(tid)
+            self._legacy_read_conns[tid] = (current, conn)
+        if prev is not None and prev[1] is not conn:
+            try:
+                prev[1].close()
+            except Exception:
+                pass
         return conn
 
     def close(self) -> None:
-        with self._read_conns_lock:
-            for c in self._read_conns:
-                try:
-                    c.close()
-                except Exception:
-                    pass
-            self._read_conns.clear()
-        self._read_local = threading.local()
+        with self._legacy_read_lock:
+            self._closed = True
+            legacy_conns = [c for _, c in self._legacy_read_conns.values()]
+            self._legacy_read_conns.clear()
+        for c in legacy_conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+        self._read_pool.close()
         with self._db_write_lock:
             try:
                 self._write_conn.close()
@@ -367,7 +539,8 @@ class SessionHubStore:
             if not skip_local and (
                 force_local or (now_ms - self._last_local_scan_ms > 8_000)
             ):
-                initial_cache = FileParseCache.load_entries(self._get_read_conn())
+                with self._read_conn() as read_conn:
+                    initial_cache = FileParseCache.load_entries(read_conn)
                 parse_cache = FileParseCache(initial_entries=initial_cache)
                 local_sessions = collect_all_local_sessions(
                     mid, mname, cache=parse_cache
@@ -393,9 +566,10 @@ class SessionHubStore:
             )
 
             elapsed_ms = int((time.time() - t0) * 1000)
-            total = self._get_read_conn().execute(
-                "SELECT count(*) FROM sessions"
-            ).fetchone()[0]
+            with self._read_conn() as read_conn:
+                total = read_conn.execute(
+                    "SELECT count(*) FROM sessions"
+                ).fetchone()[0]
             health = self.get_sync_health()
             return {
                 "ok": True,
@@ -447,6 +621,7 @@ class SessionHubStore:
 
 
 __all__ = [
+    "DEFAULT_READ_POOL_SIZE",
     "ICLOUD_SYNC_ROOT",
     "INDEX_DB_PATH",
     "LOCAL_SYNC_ROOT",
