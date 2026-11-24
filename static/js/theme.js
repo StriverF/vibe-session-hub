@@ -2,6 +2,23 @@ import { saveThemePreference } from "./api.js";
 import { THEME_OPTIONS, els, state } from "./state.js";
 import { escapeHtml, showToast } from "./utils.js";
 
+const LIGHT_THEME_IDS = new Set(["warm-paper", "mist-sage"]);
+
+export function syncNativeWindowAppearance(themeId = state.theme) {
+  const handler = window.webkit?.messageHandlers?.vibeHubWindow;
+  if (!handler) return;
+  const opt = THEME_OPTIONS.find((t) => t.id === themeId);
+  const isLight = LIGHT_THEME_IDS.has(themeId);
+  const bgColor = opt?.bg || (isLight ? "#f5f1e8" : "#0b0c10");
+  try {
+    handler.postMessage({
+      action: "syncAppearance",
+      colorScheme: isLight ? "light" : "dark",
+      bgColor,
+    });
+  } catch (_) {}
+}
+
 export function applyThemeLocally(themeId) {
   if (!THEME_OPTIONS.some((t) => t.id === themeId)) return;
   state.theme = themeId;
@@ -9,6 +26,7 @@ export function applyThemeLocally(themeId) {
   try {
     localStorage.setItem("vibe_hub_theme", themeId);
   } catch (_) {}
+  syncNativeWindowAppearance(themeId);
   renderAppearanceOptions();
 }
 

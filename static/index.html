@@ -9,6 +9,19 @@
     try {
       const savedTheme = localStorage.getItem("vibe_hub_theme");
       if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+      if (window.__VIBE_HUB_NATIVE__) {
+        document.documentElement.classList.add("native-macos");
+        const m = window.__VIBE_HUB_NATIVE_METRICS__;
+        if (m && typeof m.leftInset === "number") {
+          document.documentElement.style.setProperty("--native-titlebar-left", m.leftInset + "px");
+        }
+        if (m && typeof m.height === "number") {
+          document.documentElement.style.setProperty("--native-titlebar-height", m.height + "px");
+        }
+        if (m && m.isFullScreen) {
+          document.documentElement.classList.add("native-fullscreen");
+        }
+      }
     } catch (_) {}
   </script>
   <link rel="stylesheet" href="/styles.css" />
@@ -17,7 +30,7 @@
   <div class="app-shell">
     <header class="topbar">
       <div class="brand">
-        <img class="brand-logo" src="/icons/logo.png" alt="Vibe Session Hub" />
+        <img class="brand-logo" src="/icons/logo.png" alt="Vibe Session Hub" draggable="false" />
         <span class="brand-name">Vibe Session Hub</span>
         <button id="machineBadgeBtn" class="machine-chip" title="点击修改当前电脑显示名称">
           <span class="status-dot"></span>
@@ -26,7 +39,7 @@
       </div>
       <div class="topbar-actions">
         <span id="syncMeta" class="sync-meta">正在读取索引…</span>
-        <div id="updateControl" class="update-control" aria-live="polite"></div>
+        <div id="updateControl" class="update-control" data-no-drag aria-live="polite"></div>
         <button id="openThemeModalBtn" class="btn btn-ghost" title="切换配色主题">
           <span class="theme-swatch-dot" aria-hidden="true"></span>
           <span>配色主题</span>

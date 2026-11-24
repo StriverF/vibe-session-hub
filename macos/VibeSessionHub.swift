@@ -33,6 +33,72 @@ private func resolvePreferencesPort(stateDir: URL) -> Int? {
     return nil
 }
 
+private func resolvePreferencesTheme(stateDir: URL) -> String? {
+    let prefsURL = stateDir.appendingPathComponent("preferences.json")
+    if let data = try? Data(contentsOf: prefsURL),
+       let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+       let theme = json["theme"] as? String {
+        let trimmed = theme.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+    return nil
+}
+
+private func defaultThemeAppearance(_ themeId: String?) -> (isLight: Bool, bgHex: String) {
+    switch themeId {
+    case "obsidian-amber":
+        return (false, "#111113")
+    case "graphite-mono":
+        return (false, "#0c0c0e")
+    case "forest-sage":
+        return (false, "#0c1210")
+    case "espresso-copper":
+        return (false, "#14110f")
+    case "plum-amethyst":
+        return (false, "#110e17")
+    case "crimson-rose":
+        return (false, "#121012")
+    case "warm-paper":
+        return (true, "#f5f1e8")
+    case "mist-sage":
+        return (true, "#f1f4f2")
+    default:
+        return (false, "#0b0c10")
+    }
+}
+
+private func parseHexColor(_ raw: String) -> NSColor? {
+    var hex = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if hex.hasPrefix("#") {
+        hex.removeFirst()
+    }
+    if hex.count == 3 {
+        hex = hex.map { "\($0)\($0)" }.joined()
+    }
+    guard hex.count == 6, let rgb = UInt32(hex, radix: 16) else {
+        return nil
+    }
+    let r = CGFloat((rgb >> 16) & 0xFF) / 255.0
+    let g = CGFloat((rgb >> 8) & 0xFF) / 255.0
+    let b = CGFloat(rgb & 0xFF) / 255.0
+    return NSColor(srgbRed: r, green: g, blue: b, alpha: 1.0)
+}
+
+private func performTitlebarDoubleClick(on window: NSWindow) {
+    guard !window.styleMask.contains(.fullScreen) else { return }
+    let pref = (UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") ?? "Maximize")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    switch pref {
+    case "minimize":
+        window.performMiniaturize(nil)
+    case "none":
+        break
+    default:
+        window.performZoom(nil)
+    }
+}
+
 private func resolveHubPort(stateDir: URL) -> Int {
     // 1. CLI flag: --port <N> or --port=<N>
     let args = CommandLine.arguments
@@ -106,9 +172,43 @@ private enum LaunchAgentError: LocalizedError {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler {
+final class HubWebView: WKWebView {
+    var titlebarInteractiveHeight: CGFloat = 52.0
+    var allowDirectTopbarDrag: (() -> Bool)?
+
+    private func isInTopbarRegion(_ event: NSEvent?) -> Bool {
+        guard let event = event, let win = window else { return false }
+        let yFromTop = win.frame.height - event.locationInWindow.y
+        return yFromTop >= 0 && yFromTop <= titlebarInteractiveHeight
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        if isInTopbarRegion(event) {
+            return true
+        }
+        return super.acceptsFirstMouse(for: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if let allowDirect = allowDirectTopbarDrag,
+           allowDirect(),
+           let win = window,
+           !win.styleMask.contains(.fullScreen),
+           isInTopbarRegion(event) {
+            if event.clickCount == 2 {
+                performTitlebarDoubleClick(on: win)
+                return
+            }
+            win.performDrag(with: event)
+            return
+        }
+        super.mouseDown(with: event)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUIDelegate, WKNavigationDelegate, WKScriptMessageHandler {
     var window: NSWindow!
-    var webView: WKWebView!
+    var webView: HubWebView!
     private var backendProcess: Process?
     private let backendProcessLock = NSLock()
     var syncTimer: Timer?
@@ -117,6 +217,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     private var backendReady = false
     private var pendingOpenURL: URL?
     private var updater: AppUpdater!
+    private var mouseEventMonitor: Any?
+    private var lastLeftMouseDownEvent: NSEvent?
+    private var currentThemeIsLight = false
+    private var currentThemeBgHex = "#0b0c10"
 
     let hubPort: Int
     let hubURL: URL
@@ -276,7 +380,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     func applicationWillTerminate(_ notification: Notification) {
         updater?.handleAppWillTerminate()
+        if let monitor = mouseEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseEventMonitor = nil
+        }
+        lastLeftMouseDownEvent = nil
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "vibeHubUpdater")
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "vibeHubWindow")
         terminateLocalFallbackBackend()
     }
 
@@ -379,7 +489,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenuItem.submenu = editMenu
 
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(NSMenuItem.separator())
+        let fullScreenItem = NSMenuItem(
+            title: "进入全屏幕",
+            action: #selector(NSWindow.toggleFullScreen(_:)),
+            keyEquivalent: "f"
+        )
+        fullScreenItem.keyEquivalentModifierMask = [.command, .control]
+        windowMenu.addItem(fullScreenItem)
+        windowMenuItem.submenu = windowMenu
+
         NSApp.mainMenu = mainMenu
+        NSApp.windowsMenu = windowMenu
     }
 
     @objc private func reloadPage() {
@@ -404,6 +530,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
 
     private func showLoadingScreen(subtitle: String) {
         guard webView != nil else { return }
+        let bg = currentThemeBgHex
+        let fg = currentThemeIsLight ? "#1c1917" : "#f3f4f8"
+        let muted = currentThemeIsLight ? "#6b655e" : "#9ea3b8"
+        let ringTrack = currentThemeIsLight ? "rgba(139, 92, 246, 0.18)" : "rgba(139, 92, 246, 0.22)"
         let html = """
         <!doctype html>
         <html lang="zh-CN">
@@ -412,18 +542,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
           <style>
             body {
               margin: 0; height: 100vh; display: grid; place-items: center;
-              background: #0b0c10; color: #f3f4f8;
+              background: \(bg); color: \(fg);
               font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+              user-select: none; -webkit-user-select: none;
             }
             .box { text-align: center; max-width: 440px; padding: 24px; }
             .ring {
               width: 34px; height: 34px; margin: 0 auto 18px; border-radius: 50%;
-              border: 3px solid rgba(139, 92, 246, 0.22);
+              border: 3px solid \(ringTrack);
               border-top-color: #8b5cf6;
               animation: spin 0.9s linear infinite;
             }
             h1 { font-size: 16px; font-weight: 600; margin: 0 0 8px; }
-            p { font-size: 13px; color: #9ea3b8; margin: 0; line-height: 1.5; }
+            p { font-size: 13px; color: \(muted); margin: 0; line-height: 1.5; }
             @keyframes spin { to { transform: rotate(360deg); } }
           </style>
         </head>
@@ -628,35 +759,213 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
         }
     }
 
+    private func isMainAppPageURL(_ url: URL?) -> Bool {
+        guard isLocalHubURL(url), let path = url?.path else {
+            return false
+        }
+        return path.isEmpty || path == "/" || path == "/index.html"
+    }
+
+    private func computeNativeTitlebarMetrics(
+        fullScreenOverride: Bool? = nil
+    ) -> (leftInset: Int, height: Int, isFullScreen: Bool) {
+        guard let win = window else {
+            return (95, 52, fullScreenOverride ?? false)
+        }
+        let isFullScreen = fullScreenOverride ?? win.styleMask.contains(.fullScreen)
+        var leftInset = 95
+        var height = 52
+        if let closeBtn = win.standardWindowButton(.closeButton),
+           let zoomBtn = win.standardWindowButton(.zoomButton) {
+            let closeInWin = closeBtn.convert(closeBtn.bounds, to: nil)
+            let zoomInWin = zoomBtn.convert(zoomBtn.bounds, to: nil)
+            let centerFromTop = win.frame.height - closeInWin.midY
+            if centerFromTop >= 14 && centerFromTop <= 40 {
+                height = max(48, Int(round(centerFromTop * 2.0)))
+            }
+            if zoomInWin.maxX >= 50 && zoomInWin.maxX <= 140 {
+                leftInset = Int(ceil(zoomInWin.maxX)) + 16
+            }
+        }
+        if isFullScreen {
+            return (18, height, true)
+        }
+        return (leftInset, height, false)
+    }
+
+    private func applyWindowAppearance(isLight: Bool, bgHex: String) {
+        currentThemeIsLight = isLight
+        currentThemeBgHex = bgHex
+        guard let win = window else { return }
+        win.appearance = NSAppearance(named: isLight ? .aqua : .darkAqua)
+        if let color = parseHexColor(bgHex) {
+            win.backgroundColor = color
+            if webView != nil {
+                webView.underPageBackgroundColor = color
+            }
+        }
+    }
+
+    private func pushWindowMetricsToWebView(fullScreenOverride: Bool? = nil) {
+        let metrics = computeNativeTitlebarMetrics(fullScreenOverride: fullScreenOverride)
+        if webView != nil {
+            webView.titlebarInteractiveHeight = CGFloat(metrics.height)
+        }
+        let payload: [String: Any] = [
+            "leftInset": metrics.leftInset,
+            "height": metrics.height,
+            "isFullScreen": metrics.isFullScreen,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              var jsonStr = String(data: data, encoding: .utf8) else {
+            return
+        }
+        jsonStr = jsonStr
+            .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
+            .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self,
+                  self.webView != nil,
+                  self.isLocalHubURL(self.webView.url) else {
+                return
+            }
+            let js = """
+            (function(m) {
+              var root = document.documentElement;
+              if (root) {
+                root.classList.add("native-macos");
+                root.classList.toggle("native-fullscreen", Boolean(m.isFullScreen));
+                root.style.setProperty("--native-titlebar-left", m.leftInset + "px");
+                root.style.setProperty("--native-titlebar-height", m.height + "px");
+              }
+              if (window.__vibeHubReceiveWindowMetrics) {
+                window.__vibeHubReceiveWindowMetrics(m);
+              }
+            })(\(jsonStr));
+            """
+            self.webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        pushWindowMetricsToWebView(fullScreenOverride: true)
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        pushWindowMetricsToWebView()
+    }
+
+    func windowWillExitFullScreen(_ notification: Notification) {
+        pushWindowMetricsToWebView(fullScreenOverride: false)
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        pushWindowMetricsToWebView()
+    }
+
+    private func installMouseEventMonitor() {
+        if let existing = mouseEventMonitor {
+            NSEvent.removeMonitor(existing)
+            mouseEventMonitor = nil
+        }
+        mouseEventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseUp]
+        ) { [weak self] event in
+            guard let self = self,
+                  let win = self.window,
+                  event.window === win else {
+                return event
+            }
+            if event.type == .leftMouseDown {
+                self.lastLeftMouseDownEvent = event
+            } else if event.type == .leftMouseUp {
+                self.lastLeftMouseDownEvent = nil
+            }
+            return event
+        }
+    }
+
     private func setupWindow() {
-        let rect = NSRect(x: 0, y: 0, width: 1120, height: 740)
+        let rect = NSRect(x: 0, y: 0, width: 1180, height: 760)
         window = NSWindow(
             contentRect: rect,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.center()
         window.title = "Vibe Session Hub"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.isMovableByWindowBackground = false
         window.minSize = NSSize(width: 760, height: 500)
         window.isReleasedWhenClosed = false
+        window.delegate = self
+
+        let toolbar = NSToolbar(identifier: "VibeSessionHubUnifiedToolbar")
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        toolbar.displayMode = .iconOnly
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+
+        let savedTheme = resolvePreferencesTheme(stateDir: stateDir)
+        let initialAppearance = defaultThemeAppearance(savedTheme)
+        applyWindowAppearance(isLight: initialAppearance.isLight, bgHex: initialAppearance.bgHex)
+
+        window.layoutIfNeeded()
+        let initialMetrics = computeNativeTitlebarMetrics()
 
         let cfg = WKWebViewConfiguration()
         let contentController = WKUserContentController()
+        let nativeInitSource = """
+        window.__VIBE_HUB_NATIVE__ = true;
+        window.__VIBE_HUB_NATIVE_METRICS__ = {
+          leftInset: \(initialMetrics.leftInset),
+          height: \(initialMetrics.height),
+          isFullScreen: \(initialMetrics.isFullScreen ? "true" : "false")
+        };
+        (function() {
+          function apply() {
+            var root = document.documentElement;
+            if (!root) return false;
+            root.classList.add("native-macos");
+            root.classList.toggle("native-fullscreen", window.__VIBE_HUB_NATIVE_METRICS__.isFullScreen);
+            root.style.setProperty("--native-titlebar-left", window.__VIBE_HUB_NATIVE_METRICS__.leftInset + "px");
+            root.style.setProperty("--native-titlebar-height", window.__VIBE_HUB_NATIVE_METRICS__.height + "px");
+            return true;
+          }
+          if (!apply()) {
+            document.addEventListener("DOMContentLoaded", apply, { once: true });
+          }
+        })();
+        """
         let nativeFlagScript = WKUserScript(
-            source: "window.__VIBE_HUB_NATIVE__ = true;",
+            source: nativeInitSource,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
         contentController.addUserScript(nativeFlagScript)
         contentController.add(self, name: "vibeHubUpdater")
+        contentController.add(self, name: "vibeHubWindow")
         cfg.userContentController = contentController
 
-        webView = WKWebView(frame: rect, configuration: cfg)
+        webView = HubWebView(frame: rect, configuration: cfg)
         webView.uiDelegate = self
         webView.navigationDelegate = self
         webView.autoresizingMask = [.width, .height]
+        webView.titlebarInteractiveHeight = CGFloat(initialMetrics.height)
+        webView.allowDirectTopbarDrag = { [weak self] in
+            guard let self = self else { return false }
+            return !self.isMainAppPageURL(self.webView?.url)
+        }
+        if let bgColor = window.backgroundColor {
+            webView.underPageBackgroundColor = bgColor
+        }
         window.contentView = webView
+        installMouseEventMonitor()
         window.makeKeyAndOrderFront(nil)
     }
 
@@ -1110,16 +1419,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard isLocalHubURL(webView.url), let updater = updater else { return }
-        pushUpdaterStateToWebView(updater.snapshotDictionary())
+        guard isLocalHubURL(webView.url) else { return }
+        pushWindowMetricsToWebView()
+        if let updater = updater {
+            pushUpdaterStateToWebView(updater.snapshotDictionary())
+        }
     }
 
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
-        guard message.name == "vibeHubUpdater",
-              message.frameInfo.isMainFrame else {
+        guard message.frameInfo.isMainFrame else {
             return
         }
         let origin = message.frameInfo.securityOrigin
@@ -1129,7 +1440,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNaviga
             return
         }
         guard let body = message.body as? [String: Any],
-              let action = body["action"] as? String,
+              let action = body["action"] as? String else {
+            return
+        }
+
+        if message.name == "vibeHubWindow" {
+            switch action {
+            case "startDrag":
+                guard let win = window,
+                      !win.styleMask.contains(.fullScreen),
+                      (NSEvent.pressedMouseButtons & 1) != 0,
+                      let downEvent = lastLeftMouseDownEvent,
+                      downEvent.type == .leftMouseDown,
+                      downEvent.window === win else {
+                    return
+                }
+                lastLeftMouseDownEvent = nil
+                win.performDrag(with: downEvent)
+            case "doubleClickTitlebar":
+                if let win = window {
+                    performTitlebarDoubleClick(on: win)
+                }
+            case "syncAppearance":
+                let isLight = (body["colorScheme"] as? String)?.lowercased() == "light"
+                let bgHex = (body["bgColor"] as? String) ?? (isLight ? "#f5f1e8" : "#0b0c10")
+                if parseHexColor(bgHex) != nil {
+                    applyWindowAppearance(isLight: isLight, bgHex: bgHex)
+                }
+            case "requestMetrics":
+                pushWindowMetricsToWebView()
+            default:
+                break
+            }
+            return
+        }
+
+        guard message.name == "vibeHubUpdater",
               let updater = updater else {
             return
         }
