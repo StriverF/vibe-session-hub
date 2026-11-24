@@ -65,6 +65,11 @@ cat > "$PLIST_PATH" <<EOF
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
   <key>StandardOutPath</key>
   <string>$HOME/.vibe-session-hub/server.log</string>
   <key>StandardErrorPath</key>

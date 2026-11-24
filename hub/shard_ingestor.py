@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -8,7 +9,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .config import HubPaths
 from .tool_registry import get_tool_label
@@ -293,16 +294,34 @@ class ShardIngestor:
     def __init__(
         self,
         paths: HubPaths,
-        get_read_conn: Callable[[], sqlite3.Connection],
-        write_conn: sqlite3.Connection,
-        db_write_lock: threading.Lock,
+        get_read_conn: Callable[[], sqlite3.Connection] | None = None,
+        write_conn: sqlite3.Connection | None = None,
+        db_write_lock: threading.Lock | None = None,
         parse_node_shard_fn: Callable[[Path], dict[str, dict[str, Any]]] | None = None,
+        acquire_read_conn: Callable[
+            [], contextlib.AbstractContextManager[sqlite3.Connection]
+        ]
+        | None = None,
     ) -> None:
+        if acquire_read_conn is None and get_read_conn is None:
+            raise ValueError("Either acquire_read_conn or get_read_conn must be provided")
+        if write_conn is None or db_write_lock is None:
+            raise ValueError("write_conn and db_write_lock are required")
         self.paths = paths
         self._get_read_conn = get_read_conn
+        self._acquire_read_conn = acquire_read_conn
         self._write_conn = write_conn
         self._db_write_lock = db_write_lock
         self._parse_node_shard = parse_node_shard_fn or parse_node_shard
+
+    @contextlib.contextmanager
+    def _read_conn(self) -> Iterator[sqlite3.Connection]:
+        if self._acquire_read_conn is not None:
+            with self._acquire_read_conn() as conn:
+                yield conn
+            return
+        assert self._get_read_conn is not None
+        yield self._get_read_conn()
 
     def append_manual_link(
         self, data: dict[str, Any], machine_info: dict[str, Any]
@@ -341,13 +360,13 @@ class ShardIngestor:
         force_reindex: bool = False,
         dirty_shards: set[str] | None = None,
     ) -> bool:
-        read_conn = self._get_read_conn()
-        prev_state: dict[str, tuple[int, int]] = {
-            str(r["shard_key"]): (int(r["mtime_ns"]), int(r["size"]))
-            for r in read_conn.execute(
-                "SELECT shard_key, mtime_ns, size FROM shard_state"
-            ).fetchall()
-        }
+        with self._read_conn() as read_conn:
+            prev_state: dict[str, tuple[int, int]] = {
+                str(r["shard_key"]): (int(r["mtime_ns"]), int(r["size"]))
+                for r in read_conn.execute(
+                    "SELECT shard_key, mtime_ns, size FROM shard_state"
+                ).fetchall()
+            }
         curr_state, node_paths = scan_disk_shards(
             self.paths.nodes_dir, self.paths.manual_links_dir
         )
@@ -379,9 +398,12 @@ class ShardIngestor:
         attachments, standalones = load_manual_links(self.paths.manual_links_dir)
 
         if links_changed:
-            changed_node_keys.update(
-                self._find_link_affected_shards(read_conn, attachments, curr_node_keys)
-            )
+            with self._read_conn() as read_conn:
+                changed_node_keys.update(
+                    self._find_link_affected_shards(
+                        read_conn, attachments, curr_node_keys
+                    )
+                )
 
         # Parse ONLY changed shards outside _db_write_lock
         prepared_by_shard: dict[

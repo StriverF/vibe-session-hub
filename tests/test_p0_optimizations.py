@@ -760,6 +760,158 @@ class TestP0ConcurrencyAndCaching(IsolatedHubTestCase):
         self.assertLess(calls, 5)
         self.assertLess(elapsed, 0.7)
 
+    def test_read_connection_pool_stays_bounded_across_many_http_requests(self) -> None:
+        seed = [
+            _make_session("mac-local01", f"s{i}", f"连接池回归测试 {i} 登录鉴权")
+            for i in range(10)
+        ]
+        real_connect = storage_mod.sqlite3.connect
+        conn_lock = threading.Lock()
+        open_conns = 0
+        peak_conns = 0
+        total_created = 0
+
+        class _TrackedConnection(sqlite3.Connection):
+            def close(self) -> None:
+                nonlocal open_conns
+                if not getattr(self, "_tracked_closed", False):
+                    self._tracked_closed = True
+                    with conn_lock:
+                        open_conns -= 1
+                super().close()
+
+        def tracked_connect(*args, **kwargs):
+            nonlocal open_conns, peak_conns, total_created
+            kwargs.setdefault("factory", _TrackedConnection)
+            c = real_connect(*args, **kwargs)
+            c._tracked_closed = False
+            with conn_lock:
+                open_conns += 1
+                total_created += 1
+                if open_conns > peak_conns:
+                    peak_conns = open_conns
+            return c
+
+        with mock.patch.object(storage_mod.sqlite3, "connect", side_effect=tracked_connect):
+            store = storage_mod.SessionHubStore(local_only=True, read_pool_size=4)
+            try:
+                with mock.patch.object(
+                    storage_mod, "collect_all_local_sessions", return_value=seed
+                ):
+                    store.sync_now(force_local=True)
+
+                srv = server_mod.create_http_server(store, host="127.0.0.1", port=0)
+                port = srv.server_address[1]
+                srv_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+                srv_thread.start()
+                try:
+                    # 1. Sequential HTTP requests across 160 distinct ThreadingHTTPServer threads
+                    # Previously this leaked 160 SQLite read connections (320 FDs -> EMFILE under launchd).
+                    for idx in range(160):
+                        endpoint = (
+                            f"http://127.0.0.1:{port}/api/facets"
+                            if idx % 5 == 0
+                            else f"http://127.0.0.1:{port}/api/search?q=%E7%99%BB%E5%BD%95%E9%89%B4%E6%9D%83"
+                        )
+                        with urlopen(endpoint, timeout=3) as resp:
+                            self.assertEqual(resp.status, 200)
+                            payload = json.loads(resp.read().decode("utf-8"))
+                        if idx % 5 == 0:
+                            self.assertEqual(payload["total"], 10)
+                        else:
+                            self.assertEqual(len(payload["items"]), 10)
+
+                    stats_after_seq = store.read_pool_stats()
+                    self.assertEqual(stats_after_seq["in_use"], 0)
+                    self.assertLessEqual(stats_after_seq["idle"], 4)
+                    # 1 write_conn + at most 4 pooled read conns
+                    self.assertLessEqual(open_conns, 5)
+                    # Warm pool reuse means far fewer connects than 160 requests
+                    self.assertLess(total_created, 20)
+
+                    # 2. High-concurrency burst exceeding max_idle (20 threads > pool max 4)
+                    burst_errors: list[Exception] = []
+
+                    def burst_worker(i: int) -> None:
+                        try:
+                            with urlopen(
+                                f"http://127.0.0.1:{port}/api/search?q=%E7%99%BB%E5%BD%95%E9%89%B4%E6%9D%83",
+                                timeout=5,
+                            ) as resp:
+                                data = json.loads(resp.read().decode("utf-8"))
+                                assert resp.status == 200
+                                assert len(data["items"]) == 10
+                        except Exception as exc:
+                            burst_errors.append(exc)
+
+                    workers = [
+                        threading.Thread(target=burst_worker, args=(i,))
+                        for i in range(20)
+                    ]
+                    for w in workers:
+                        w.start()
+                    for w in workers:
+                        w.join(timeout=5.0)
+                    self.assertEqual(burst_errors, [])
+
+                    # Overflow connections must be closed immediately after burst settles
+                    stats_after_burst = store.read_pool_stats()
+                    self.assertEqual(stats_after_burst["in_use"], 0)
+                    self.assertLessEqual(stats_after_burst["idle"], 4)
+                    self.assertLessEqual(open_conns, 5)
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+            finally:
+                store.close()
+
+        # After store.close(), every SQLite connection must be closed
+        self.assertEqual(open_conns, 0)
+
+    def test_pr_resolution_releases_read_conn_before_external_lookup(self) -> None:
+        seed = [_make_session("mac-local01", "s1", "排查 PR 关联会话")]
+        store = storage_mod.SessionHubStore(local_only=True, read_pool_size=2)
+        try:
+            with mock.patch.object(
+                storage_mod, "collect_all_local_sessions", return_value=seed
+            ):
+                store.sync_now(force_local=True)
+
+            in_use_during_git: list[int] = []
+
+            def spy_git(pr_num: str, repos: list[str], total_budget_sec: float = 2.5):
+                in_use_during_git.append(store.read_pool_stats()["in_use"])
+                return None
+
+            with mock.patch.object(
+                storage_mod, "resolve_pr_from_local_git", side_effect=spy_git
+            ), mock.patch.object(
+                storage_mod, "resolve_pr_via_gh", return_value=None
+            ):
+                store.search("PR #54321", resolve_remote_pr=False)
+
+            self.assertEqual(in_use_during_git, [0])
+            self.assertEqual(store.read_pool_stats()["in_use"], 0)
+        finally:
+            store.close()
+
+    def test_legacy_get_read_conn_prunes_exited_threads(self) -> None:
+        store = storage_mod.SessionHubStore(local_only=True)
+        try:
+            for _ in range(30):
+                t = threading.Thread(
+                    target=lambda: store._get_read_conn().execute("SELECT 1").fetchone()
+                )
+                t.start()
+                t.join(timeout=2.0)
+
+            # Next access prunes all exited threads' legacy connections
+            store._get_read_conn().execute("SELECT 1").fetchone()
+            with store._legacy_read_lock:
+                self.assertEqual(len(store._legacy_read_conns), 1)
+        finally:
+            store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

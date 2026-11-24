@@ -912,6 +912,9 @@ let customPlist = buildLaunchAgentPlist(
     sendURLHelperPath: "/Applications/Vibe Session Hub.app/Contents/MacOS/send_url_to_pid"
 )
 expect(extractLaunchAgentConfiguredPort(plistDict: customPlist, fallbackPort: 17380) == 18421, "custom --port extracted")
+let softLimits = customPlist["SoftResourceLimits"] as? [String: Any]
+expect((softLimits?["NumberOfFiles"] as? Int) == launchAgentSoftFileLimit, "SoftResourceLimits.NumberOfFiles matches constant")
+expect((softLimits?["NumberOfFiles"] as? Int ?? 0) >= 4096, "SoftResourceLimits.NumberOfFiles >= 4096")
 
 // 5. Ephemeral bundle detection & ps parsing
 expect(

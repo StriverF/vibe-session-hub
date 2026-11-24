@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -8,7 +9,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .git_pr_resolver import (
     parse_pr_query,
@@ -119,14 +120,23 @@ class SearchEngine:
 
     def __init__(
         self,
-        get_read_conn: Callable[[], sqlite3.Connection],
-        write_conn: sqlite3.Connection,
-        db_write_lock: threading.Lock,
-        get_machine_info_fn: Callable[[], dict[str, Any]],
+        get_read_conn: Callable[[], sqlite3.Connection] | None = None,
+        write_conn: sqlite3.Connection | None = None,
+        db_write_lock: threading.Lock | None = None,
+        get_machine_info_fn: Callable[[], dict[str, Any]] | None = None,
         resolve_local_git_fn: Callable[..., dict[str, Any] | None] | None = None,
         resolve_gh_fn: Callable[..., dict[str, Any] | None] | None = None,
+        acquire_read_conn: Callable[
+            [], contextlib.AbstractContextManager[sqlite3.Connection]
+        ]
+        | None = None,
     ) -> None:
+        if acquire_read_conn is None and get_read_conn is None:
+            raise ValueError("Either acquire_read_conn or get_read_conn must be provided")
+        if write_conn is None or db_write_lock is None or get_machine_info_fn is None:
+            raise ValueError("write_conn, db_write_lock, and get_machine_info_fn are required")
         self._get_read_conn = get_read_conn
+        self._acquire_read_conn = acquire_read_conn
         self._write_conn = write_conn
         self._db_write_lock = db_write_lock
         self._get_machine_info = get_machine_info_fn
@@ -137,11 +147,20 @@ class SearchEngine:
         self._pr_inflight_locks: dict[str, threading.Lock] = {}
         self._pr_negative_cache: dict[tuple[str, str, bool], float] = {}
 
+    @contextlib.contextmanager
+    def _read_conn(self) -> Iterator[sqlite3.Connection]:
+        if self._acquire_read_conn is not None:
+            with self._acquire_read_conn() as conn:
+                yield conn
+            return
+        assert self._get_read_conn is not None
+        yield self._get_read_conn()
+
     def get_session_by_uid(self, uid: str) -> dict[str, Any] | None:
-        conn = self._get_read_conn()
-        row = conn.execute(
-            "SELECT * FROM sessions WHERE uid = ?", (uid,)
-        ).fetchone()
+        with self._read_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE uid = ?", (uid,)
+            ).fetchone()
         if not row:
             return None
         minfo = self._get_machine_info()
@@ -150,18 +169,18 @@ class SearchEngine:
     def get_facets(
         self, sync_root: str, health: dict[str, Any]
     ) -> dict[str, Any]:
-        conn = self._get_read_conn()
         minfo = self._get_machine_info()
-        tools = conn.execute(
-            "SELECT tool, tool_label, count(*) AS cnt FROM sessions GROUP BY tool ORDER BY cnt DESC"
-        ).fetchall()
-        machines = conn.execute(
-            "SELECT machine_id, MAX(machine_name) AS machine_name, count(*) AS cnt FROM sessions GROUP BY machine_id ORDER BY cnt DESC"
-        ).fetchall()
-        pr_count = conn.execute(
-            "SELECT count(*) FROM sessions WHERE pr_numbers != ''"
-        ).fetchone()[0]
-        total = conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
+        with self._read_conn() as conn:
+            tools = conn.execute(
+                "SELECT tool, tool_label, count(*) AS cnt FROM sessions GROUP BY tool ORDER BY cnt DESC"
+            ).fetchall()
+            machines = conn.execute(
+                "SELECT machine_id, MAX(machine_name) AS machine_name, count(*) AS cnt FROM sessions GROUP BY machine_id ORDER BY cnt DESC"
+            ).fetchall()
+            pr_count = conn.execute(
+                "SELECT count(*) FROM sessions WHERE pr_numbers != ''"
+            ).fetchone()[0]
+            total = conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
         return {
             "current_machine": minfo,
             "sync_root": sync_root,
@@ -224,8 +243,8 @@ class SearchEngine:
     def _resolve_pr_info(
         self, pr_num: str, repo_slug: str | None, allow_remote: bool
     ) -> dict[str, Any] | None:
-        conn = self._get_read_conn()
-        cached_data = self._read_pr_cache(conn, pr_num)
+        with self._read_conn() as conn:
+            cached_data = self._read_pr_cache(conn, pr_num)
         if cached_data and (cached_data.get("branch") or not allow_remote):
             return cached_data
 
@@ -237,16 +256,19 @@ class SearchEngine:
 
         pr_lock = self._get_pr_inflight_lock(pr_num)
         with pr_lock:
-            cached_data = self._read_pr_cache(conn, pr_num)
-            if cached_data and (cached_data.get("branch") or not allow_remote):
-                return cached_data
-
-            now_mono = time.monotonic()
-            with self._pr_inflight_guard:
-                if now_mono < self._pr_negative_cache.get(neg_key, 0.0):
+            with self._read_conn() as conn:
+                cached_data = self._read_pr_cache(conn, pr_num)
+                if cached_data and (cached_data.get("branch") or not allow_remote):
                     return cached_data
 
-            repos = self._get_candidate_repos(conn)
+                now_mono = time.monotonic()
+                with self._pr_inflight_guard:
+                    if now_mono < self._pr_negative_cache.get(neg_key, 0.0):
+                        return cached_data
+
+                repos = self._get_candidate_repos(conn)
+
+            # Release read connection before running git / gh subprocesses
             info = cached_data or self._resolve_local_git(
                 pr_num, repos, total_budget_sec=2.5
             )
@@ -314,7 +336,6 @@ class SearchEngine:
 
     def _search_pr_signals(
         self,
-        conn: sqlite3.Connection,
         pr_num: str,
         repo_slug: str | None,
         resolve_remote_pr: bool,
@@ -322,68 +343,70 @@ class SearchEngine:
         base_params: list[Any],
         scored: dict[str, tuple[float, sqlite3.Row, str, str]],
     ) -> dict[str, Any] | None:
-        # 1. Exact B-Tree lookup via session_prs
-        direct_rows = conn.execute(
-            f"""
-            SELECT s.*
-            FROM session_prs sp
-            JOIN sessions s ON s.uid = sp.uid
-            WHERE sp.pr_number = ? {filter_sql}
-            ORDER BY s.updated_at DESC
-            """,
-            [pr_num, *base_params],
-        ).fetchall()
-        for r in direct_rows:
-            scored[r["uid"]] = (
-                1000.0 + (r["updated_at"] / 1e13),
-                r,
-                f"直接绑定 PR #{pr_num}",
-                "",
-            )
-
-        # 2. PR mention lookup (FTS5 trigram for >=3 digits, LIKE fallback for 1-2 digits)
-        mention_rows: list[sqlite3.Row] = []
-        if len(pr_num) >= 3:
-            try:
-                mention_rows = self._fts_search_rows(
-                    conn,
-                    f"{{title branches_text search_text}} : {escape_fts_phrase(pr_num)}",
-                    filter_sql,
-                    base_params,
-                    limit=80,
-                )
-            except sqlite3.OperationalError:
-                mention_rows = []
-        if not mention_rows and len(pr_num) < 3:
-            mention_rows = conn.execute(
+        with self._read_conn() as conn:
+            # 1. Exact B-Tree lookup via session_prs
+            direct_rows = conn.execute(
                 f"""
-                SELECT s.* FROM sessions s
-                WHERE (s.search_text LIKE ? OR s.title LIKE ? OR s.branches_text LIKE ?) {filter_sql}
+                SELECT s.*
+                FROM session_prs sp
+                JOIN sessions s ON s.uid = sp.uid
+                WHERE sp.pr_number = ? {filter_sql}
                 ORDER BY s.updated_at DESC
-                LIMIT 80
                 """,
-                [f"%{pr_num}%", f"%{pr_num}%", f"%{pr_num}%", *base_params],
+                [pr_num, *base_params],
             ).fetchall()
-
-        for r in mention_rows:
-            if r["uid"] not in scored:
-                snip = extract_snippet(r["search_text"], [pr_num])
+            for r in direct_rows:
                 scored[r["uid"]] = (
-                    650.0 + (r["updated_at"] / 1e13),
+                    1000.0 + (r["updated_at"] / 1e13),
                     r,
-                    f"会话提及 #{pr_num}",
-                    snip,
+                    f"直接绑定 PR #{pr_num}",
+                    "",
                 )
 
-        # 3. Lock-free PR resolution (local git + optional gh CLI)
+            # 2. PR mention lookup (FTS5 trigram for >=3 digits, LIKE fallback for 1-2 digits)
+            mention_rows: list[sqlite3.Row] = []
+            if len(pr_num) >= 3:
+                try:
+                    mention_rows = self._fts_search_rows(
+                        conn,
+                        f"{{title branches_text search_text}} : {escape_fts_phrase(pr_num)}",
+                        filter_sql,
+                        base_params,
+                        limit=80,
+                    )
+                except sqlite3.OperationalError:
+                    mention_rows = []
+            if not mention_rows and len(pr_num) < 3:
+                mention_rows = conn.execute(
+                    f"""
+                    SELECT s.* FROM sessions s
+                    WHERE (s.search_text LIKE ? OR s.title LIKE ? OR s.branches_text LIKE ?) {filter_sql}
+                    ORDER BY s.updated_at DESC
+                    LIMIT 80
+                    """,
+                    [f"%{pr_num}%", f"%{pr_num}%", f"%{pr_num}%", *base_params],
+                ).fetchall()
+
+            for r in mention_rows:
+                if r["uid"] not in scored:
+                    snip = extract_snippet(r["search_text"], [pr_num])
+                    scored[r["uid"]] = (
+                        650.0 + (r["updated_at"] / 1e13),
+                        r,
+                        f"会话提及 #{pr_num}",
+                        snip,
+                    )
+
+        # 3. Lock-free PR resolution (local git + optional gh CLI) outside read conn
         need_remote = resolve_remote_pr or (len(direct_rows) == 0)
         resolved_pr = self._resolve_pr_info(pr_num, repo_slug, allow_remote=need_remote)
         if not resolved_pr:
             return None
 
-        self._apply_resolved_pr_matches(
-            conn, resolved_pr, filter_sql, base_params, scored
-        )
+        with self._read_conn() as conn:
+            self._apply_resolved_pr_matches(
+                conn, resolved_pr, filter_sql, base_params, scored
+            )
         return resolved_pr
 
     def _apply_resolved_pr_matches(
@@ -603,7 +626,6 @@ class SearchEngine:
         limit: int = 80,
     ) -> dict[str, Any]:
         t0 = time.time()
-        conn = self._get_read_conn()
         local_mid = self._get_machine_info()["machine_id"]
 
         where_clauses: list[str] = []
@@ -621,10 +643,11 @@ class SearchEngine:
         q = query.strip()
 
         if not q:
-            rows = conn.execute(
-                f"SELECT s.* FROM sessions s WHERE 1=1 {filter_sql} ORDER BY s.updated_at DESC LIMIT ?",
-                [*base_params, limit],
-            ).fetchall()
+            with self._read_conn() as conn:
+                rows = conn.execute(
+                    f"SELECT s.* FROM sessions s WHERE 1=1 {filter_sql} ORDER BY s.updated_at DESC LIMIT ?",
+                    [*base_params, limit],
+                ).fetchall()
             return {
                 "items": [row_to_dict(r, local_machine_id=local_mid) for r in rows],
                 "resolved_pr": None,
@@ -637,7 +660,6 @@ class SearchEngine:
 
         if pr_num:
             resolved_pr = self._search_pr_signals(
-                conn,
                 pr_num,
                 repo_slug,
                 resolve_remote_pr,
@@ -651,7 +673,10 @@ class SearchEngine:
         clean_terms = [t for t in clean_terms if t]
 
         if clean_terms and (not pr_num or len(scored) == 0):
-            self._search_keywords(conn, clean_terms, filter_sql, base_params, scored)
+            with self._read_conn() as conn:
+                self._search_keywords(
+                    conn, clean_terms, filter_sql, base_params, scored
+                )
 
         ordered = sorted(scored.values(), key=lambda x: x[0], reverse=True)[:limit]
         return {
