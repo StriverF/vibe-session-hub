@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 import CryptoKit
 import Darwin
 import Foundation
@@ -214,6 +215,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
     var syncTimer: Timer?
     private let syncQueue = DispatchQueue(label: "com.vibesessionhub.icloud-bridge", qos: .utility)
     private let lifecycleQueue = DispatchQueue(label: "com.vibesessionhub.lifecycle", qos: .userInitiated)
+    private let launcherQueue = DispatchQueue(label: "com.vibesessionhub.launcher", qos: .userInitiated)
+    private var hasPromptedAccessibilityThisRun = false
     private var backendReady = false
     private var pendingOpenURL: URL?
     private var updater: AppUpdater!
@@ -387,6 +390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         lastLeftMouseDownEvent = nil
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "vibeHubUpdater")
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: "vibeHubWindow")
+        webView?.configuration.userContentController.removeScriptMessageHandler(forName: "vibeHubLauncher")
         terminateLocalFallbackBackend()
     }
 
@@ -470,6 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "安装 / 更新开机后台服务", action: #selector(installLaunchAgentMenuAction), keyEquivalent: "")
         appMenu.addItem(withTitle: "卸载开机后台服务", action: #selector(uninstallLaunchAgentMenuAction), keyEquivalent: "")
+        appMenu.addItem(withTitle: "检查辅助功能权限…", action: #selector(checkAccessibilityPermissionMenuAction), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "隐藏 Vibe Session Hub", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(withTitle: "关闭窗口", action: #selector(closeCurrentWindow), keyEquivalent: "w")
@@ -518,6 +523,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
 
     @objc private func closeCurrentWindow() {
         window.orderOut(nil)
+    }
+
+    @objc private func checkAccessibilityPermissionMenuAction() {
+        if AXIsProcessTrusted() {
+            showInfoAlert(
+                title: "已授予辅助功能权限",
+                message: "Vibe Session Hub 已获得 macOS 辅助功能权限，点击 Antigravity 会话时将自动唤起窗口并定位对应会话。"
+            )
+            return
+        }
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(opts)
+        let alert = NSAlert()
+        alert.messageText = "需要授予辅助功能权限"
+        alert.informativeText = "在「系统设置 → 隐私与安全性 → 辅助功能」中开启「Vibe Session Hub」后，点击 Antigravity 会话即可自动通过 ⌘K 定位并打开对应会话。"
+        alert.addButton(withTitle: "打开系统设置")
+        alert.addButton(withTitle: "稍后")
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private func showInfoAlert(title: String, message: String) {
@@ -628,6 +654,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         return FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate.path : nil
     }
 
+    private func resolveAntigravityOpenerHelperPath() -> String? {
+        let candidate = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/open_antigravity_session")
+        return FileManager.default.isExecutableFile(atPath: candidate.path) ? candidate.path : nil
+    }
+
     private func writeAndReloadLaunchAgent(
         backendRoot: URL,
         expectedRunningPid: Int?
@@ -643,7 +674,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
             backendRoot: backendRoot,
             hubPort: hubPort,
             stateDir: stateDir,
-            sendURLHelperPath: resolveSendURLHelperPath()
+            sendURLHelperPath: resolveSendURLHelperPath(),
+            antigravityOpenerHelperPath: resolveAntigravityOpenerHelperPath()
         )
 
         let plistData: Data
@@ -950,6 +982,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         contentController.addUserScript(nativeFlagScript)
         contentController.add(self, name: "vibeHubUpdater")
         contentController.add(self, name: "vibeHubWindow")
+        contentController.add(self, name: "vibeHubLauncher")
         cfg.userContentController = contentController
 
         webView = HubWebView(frame: rect, configuration: cfg)
@@ -1254,6 +1287,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         if let helperPath = resolveSendURLHelperPath() {
             env["VIBE_HUB_SEND_URL_BIN"] = helperPath
         }
+        if let agyHelperPath = resolveAntigravityOpenerHelperPath() {
+            env["VIBE_HUB_ANTIGRAVITY_OPENER_BIN"] = agyHelperPath
+        }
         proc.environment = env
 
         try? proc.run()
@@ -1426,6 +1462,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
     }
 
+    private func pushLauncherResultToWebView(requestId: String, result: AntigravityOpenResult) {
+        let payload: [String: Any] = [
+            "requestId": requestId,
+            "result": result.toDictionary(),
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+              var jsonStr = String(data: data, encoding: .utf8) else {
+            return
+        }
+        jsonStr = jsonStr
+            .replacingOccurrences(of: "\u{2028}", with: "\\u2028")
+            .replacingOccurrences(of: "\u{2029}", with: "\\u2029")
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self,
+                  self.webView != nil,
+                  self.isLocalHubURL(self.webView.url) else {
+                return
+            }
+            let js = "(function(p){ if (window.__vibeHubResolveLauncher) { window.__vibeHubResolveLauncher(p.requestId, p.result); } })(\(jsonStr));"
+            self.webView.evaluateJavaScript(js, completionHandler: nil)
+        }
+    }
+
     func userContentController(
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
@@ -1441,6 +1501,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, WKUI
         }
         guard let body = message.body as? [String: Any],
               let action = body["action"] as? String else {
+            return
+        }
+
+        if message.name == "vibeHubLauncher" {
+            guard action == "openAntigravity",
+                  let requestId = body["requestId"] as? String,
+                  !requestId.isEmpty else {
+                return
+            }
+            let sessionId = (body["sessionId"] as? String) ?? ""
+            let title = (body["title"] as? String) ?? ""
+            let cwd = (body["cwd"] as? String) ?? ""
+            let shouldPrompt = !hasPromptedAccessibilityThisRun
+            if shouldPrompt && !AXIsProcessTrusted() {
+                hasPromptedAccessibilityThisRun = true
+            }
+            launcherQueue.async { [weak self] in
+                let result = AntigravityOpener.openSession(
+                    sessionId: sessionId,
+                    title: title,
+                    cwd: cwd,
+                    promptAccessibility: shouldPrompt
+                )
+                self?.pushLauncherResultToWebView(requestId: requestId, result: result)
+            }
             return
         }
 

@@ -191,10 +191,12 @@ fi
 
 echo "==> [2/4] Compiling macOS native binaries (${ARCH_LABEL}, min macOS ${MIN_MACOS})"
 SEND_URL_BIN="$WORK_DIR/send_url_to_pid"
+AGY_OPEN_BIN="$WORK_DIR/open_antigravity_session"
 APP_MAIN_BIN="$WORK_DIR/VibeSessionHub"
 
 compile_swift_binary "$SEND_URL_BIN" -framework AppKit -framework CoreServices "$PROJECT_DIR/macos/send_url_to_pid.swift"
-compile_swift_binary "$APP_MAIN_BIN" -framework AppKit -framework WebKit "$PROJECT_DIR/macos/BackendUpgradeLogic.swift" "$PROJECT_DIR/macos/AppUpdater.swift" "$PROJECT_DIR/macos/VibeSessionHub.swift"
+compile_swift_binary "$AGY_OPEN_BIN" -framework AppKit -framework ApplicationServices -framework Carbon -framework CoreServices "$PROJECT_DIR/macos/AntigravityOpener.swift" "$PROJECT_DIR/macos/open_antigravity_session_main.swift"
+compile_swift_binary "$APP_MAIN_BIN" -framework AppKit -framework WebKit -framework ApplicationServices -framework Carbon -framework CoreServices "$PROJECT_DIR/macos/BackendUpgradeLogic.swift" "$PROJECT_DIR/macos/AntigravityOpener.swift" "$PROJECT_DIR/macos/AppUpdater.swift" "$PROJECT_DIR/macos/VibeSessionHub.swift"
 
 echo "==> [3/4] Assembling standalone app bundle: $APP_BUNDLE"
 rm -rf "$APP_BUNDLE"
@@ -205,7 +207,8 @@ mkdir -p \
 
 cp "$APP_MAIN_BIN" "$APP_BUNDLE/Contents/MacOS/VibeSessionHub"
 cp "$SEND_URL_BIN" "$APP_BUNDLE/Contents/MacOS/send_url_to_pid"
-chmod +x "$APP_BUNDLE/Contents/MacOS/VibeSessionHub" "$APP_BUNDLE/Contents/MacOS/send_url_to_pid"
+cp "$AGY_OPEN_BIN" "$APP_BUNDLE/Contents/MacOS/open_antigravity_session"
+chmod +x "$APP_BUNDLE/Contents/MacOS/VibeSessionHub" "$APP_BUNDLE/Contents/MacOS/send_url_to_pid" "$APP_BUNDLE/Contents/MacOS/open_antigravity_session"
 cp "$ICNS_PATH" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
 # Embed standalone Python backend + static frontend assets inside the .app bundle
@@ -260,7 +263,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSAppleEventsUsageDescription</key>
-  <string>Vibe Session Hub 需要发送 AppleEvent 以将深链精准投递至对应的 Claude、Cursor、Codex 等 AI 编程客户端窗口（Used to open session deep links in the target AI coding client）。</string>
+  <string>Vibe Session Hub 需要发送 AppleEvent 以将深链精准投递至对应的 Claude、Cursor、Codex、Antigravity 等 AI 编程客户端窗口（Used to open session deep links in the target AI coding client）。</string>
   <key>VibeHubPort</key>
   <integer>${HUB_PORT}</integer>
   <key>NSAppTransportSecurity</key>
@@ -286,13 +289,18 @@ EOF
 # Strip FinderInfo / quarantine / resource-fork detritus that can break codesign
 /usr/bin/xattr -cr "$APP_BUNDLE"
 
-# Sign inside-out (helper executable first, then outer .app bundle) without deprecated --deep
+# Sign inside-out (helper executables first, then outer .app bundle) without deprecated --deep
 HELPER_BIN="$APP_BUNDLE/Contents/MacOS/send_url_to_pid"
+AGY_HELPER_BIN="$APP_BUNDLE/Contents/MacOS/open_antigravity_session"
 if [ "$SIGN_IDENTITY" = "-" ]; then
   /usr/bin/codesign --force --sign - \
     --identifier "${BUNDLE_ID}.send-url-to-pid" \
     --entitlements "$ENTITLEMENTS_PLIST" \
     "$HELPER_BIN"
+  /usr/bin/codesign --force --sign - \
+    --identifier "${BUNDLE_ID}.open-antigravity-session" \
+    --entitlements "$ENTITLEMENTS_PLIST" \
+    "$AGY_HELPER_BIN"
   /usr/bin/codesign --force --sign - \
     --entitlements "$ENTITLEMENTS_PLIST" \
     "$APP_BUNDLE"
@@ -306,11 +314,18 @@ else
   /usr/bin/codesign --force --options runtime --timestamp \
     ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} \
     --sign "$SIGN_IDENTITY" \
+    --identifier "${BUNDLE_ID}.open-antigravity-session" \
+    --entitlements "$ENTITLEMENTS_PLIST" \
+    "$AGY_HELPER_BIN"
+  /usr/bin/codesign --force --options runtime --timestamp \
+    ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} \
+    --sign "$SIGN_IDENTITY" \
     --entitlements "$ENTITLEMENTS_PLIST" \
     "$APP_BUNDLE"
 fi
 
 /usr/bin/codesign --verify --strict --verbose=2 "$HELPER_BIN"
+/usr/bin/codesign --verify --strict --verbose=2 "$AGY_HELPER_BIN"
 /usr/bin/codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 
 if [ "$APP_ONLY" -eq 1 ]; then

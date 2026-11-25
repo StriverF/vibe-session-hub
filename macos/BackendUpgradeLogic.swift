@@ -293,7 +293,8 @@ func buildLaunchAgentPlist(
     backendRoot: URL,
     hubPort: Int,
     stateDir: URL,
-    sendURLHelperPath: String?
+    sendURLHelperPath: String?,
+    antigravityOpenerHelperPath: String? = nil
 ) -> [String: Any] {
     var envVars: [String: String] = [
         "VIBE_HUB_PORT": String(hubPort),
@@ -301,6 +302,9 @@ func buildLaunchAgentPlist(
     ]
     if let helperPath = sendURLHelperPath, !helperPath.isEmpty {
         envVars["VIBE_HUB_SEND_URL_BIN"] = helperPath
+    }
+    if let agyHelperPath = antigravityOpenerHelperPath, !agyHelperPath.isEmpty {
+        envVars["VIBE_HUB_ANTIGRAVITY_OPENER_BIN"] = agyHelperPath
     }
 
     return [

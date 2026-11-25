@@ -57,34 +57,44 @@ def _run_open(args: list[str]) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _find_send_url_helper() -> str | None:
+def _find_bundled_helper(env_var: str, binary_name: str) -> str | None:
     candidates: list[Path] = []
-    env_bin = os.environ.get("VIBE_HUB_SEND_URL_BIN", "").strip()
+    env_bin = os.environ.get(env_var, "").strip()
     if env_bin:
         candidates.append(Path(env_bin))
     candidates.extend(
         [
-            PROJECT_ROOT / "macos" / "bin" / "send_url_to_pid",
-            # Standalone .app bundle layout: Contents/Resources/app/hub -> Contents/MacOS/send_url_to_pid
-            PROJECT_ROOT.parent.parent / "MacOS" / "send_url_to_pid",
+            PROJECT_ROOT / "macos" / "bin" / binary_name,
+            # Standalone .app bundle layout: Contents/Resources/app/hub -> Contents/MacOS/<binary_name>
+            PROJECT_ROOT.parent.parent / "MacOS" / binary_name,
             PROJECT_ROOT.parent
             / "Vibe Session Hub.app"
             / "Contents"
             / "MacOS"
-            / "send_url_to_pid",
-            Path("/Applications/Vibe Session Hub.app/Contents/MacOS/send_url_to_pid"),
+            / binary_name,
+            Path("/Applications/Vibe Session Hub.app/Contents/MacOS") / binary_name,
             Path.home()
             / "Applications"
             / "Vibe Session Hub.app"
             / "Contents"
             / "MacOS"
-            / "send_url_to_pid",
+            / binary_name,
         ]
     )
     for c in candidates:
         if c.is_file() and os.access(c, os.X_OK):
             return str(c)
     return None
+
+
+def _find_send_url_helper() -> str | None:
+    return _find_bundled_helper("VIBE_HUB_SEND_URL_BIN", "send_url_to_pid")
+
+
+def _find_antigravity_opener_helper() -> str | None:
+    return _find_bundled_helper(
+        "VIBE_HUB_ANTIGRAVITY_OPENER_BIN", "open_antigravity_session"
+    )
 
 
 def _find_process_pid(matcher: Callable[[str], bool]) -> int | None:
@@ -132,6 +142,134 @@ def _find_cursor_main_pid() -> int | None:
     return _find_process_pid(
         lambda cmd: "/Cursor.app/Contents/MacOS/Cursor" in cmd and "--type=" not in cmd
     )
+
+
+def _find_antigravity_main_pid() -> int | None:
+    return _find_process_pid(
+        lambda cmd: "/Antigravity.app/Contents/MacOS/Antigravity" in cmd
+        and "--type=" not in cmd
+    )
+
+
+def _resolve_antigravity_exact_title(
+    session_id: str,
+    fallback_title: str,
+    *,
+    db_paths: list[Path] | None = None,
+) -> str:
+    """Look up the freshest full conversation title from Antigravity's local DB.
+
+    Falls back to `conversations_fts.title` when `conversation_summaries.title` is empty,
+    and finally to `fallback_title` from Vibe Session Hub's index.
+    """
+    clean_fallback = re.sub(r"\s+", " ", fallback_title or "").strip()
+    if not session_id or not _is_safe_session_id(session_id):
+        return clean_fallback
+
+    if db_paths is None:
+        db_paths = [
+            Path(os.path.expanduser("~/.gemini/antigravity/conversation_summaries.db")),
+            Path(
+                os.path.expanduser("~/.gemini/antigravity-cli/conversation_summaries.db")
+            ),
+        ]
+
+    for db_path in db_paths:
+        if not db_path.is_file():
+            continue
+        con: sqlite3.Connection | None = None
+        try:
+            con = sqlite3.connect(
+                f"file:{quote(str(db_path))}?immutable=1", uri=True, timeout=1.0
+            )
+            row = con.execute(
+                "SELECT title FROM conversation_summaries WHERE conversation_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if row and row[0]:
+                candidate = re.sub(r"\s+", " ", str(row[0])).strip()
+                if candidate:
+                    return candidate
+
+            fts_cols = {
+                str(col[1])
+                for col in con.execute("PRAGMA table_info(conversations_fts)").fetchall()
+            }
+            if "title" in fts_cols:
+                if "chunk_index" in fts_cols:
+                    fts_row = con.execute(
+                        """
+                        SELECT title FROM conversations_fts
+                        WHERE conversation_id = ? AND title IS NOT NULL AND title != ''
+                        ORDER BY CASE WHEN chunk_index = -1 THEN 0 ELSE 1 END
+                        LIMIT 1
+                        """,
+                        (session_id,),
+                    ).fetchone()
+                else:
+                    fts_row = con.execute(
+                        """
+                        SELECT title FROM conversations_fts
+                        WHERE conversation_id = ? AND title IS NOT NULL AND title != ''
+                        LIMIT 1
+                        """,
+                        (session_id,),
+                    ).fetchone()
+                if fts_row and fts_row[0]:
+                    candidate = re.sub(r"\s+", " ", str(fts_row[0])).strip()
+                    if candidate:
+                        return candidate
+        except Exception as exc:
+            logger.debug(
+                "Antigravity exact title lookup skipped (%s): %s", db_path, exc
+            )
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+
+    return clean_fallback
+
+
+def _run_antigravity_opener_helper(
+    session_id: str,
+    title: str,
+    cwd: str,
+) -> dict[str, Any] | None:
+    helper = _find_antigravity_opener_helper()
+    if not helper:
+        return None
+    try:
+        res = subprocess.run(
+            [
+                helper,
+                "--session-id",
+                session_id,
+                "--title",
+                title,
+                "--cwd",
+                cwd,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=18,
+        )
+        raw_out = (res.stdout or "").strip()
+        if raw_out:
+            last_line = raw_out.splitlines()[-1].strip()
+            parsed = json.loads(last_line)
+            if isinstance(parsed, dict) and "ok" in parsed and "message" in parsed:
+                return parsed
+        logger.debug(
+            "open_antigravity_session returned unexpected output (rc=%s): %s",
+            res.returncode,
+            (res.stderr or raw_out)[:240],
+        )
+    except Exception as exc:
+        logger.debug("open_antigravity_session execution failed: %s", exc)
+    return None
 
 
 def _send_url_to_pid(pid: int, deep_link: str) -> tuple[bool, str]:
@@ -378,21 +516,72 @@ def _open_grok_bot(session_id: str, cwd: str, title: str) -> dict[str, Any]:
     )
 
 
-def _open_antigravity(session_id: str, cwd: str, title: str) -> dict[str, Any]:
-    if title:
-        copy_to_clipboard(title)
-    target_dir = _resolve_existing_dir(cwd)
-    cmd = ["/usr/bin/open", "-b", _bundle_id("antigravity")]
-    if target_dir:
-        cmd.extend(["--", target_dir])
-    ok, msg = _run_open(cmd)
+ANTIGRAVITY_FOCUS_URL = "antigravity://focus"
+ANTIGRAVITY_APP_PATH = "/Applications/Antigravity.app"
+
+
+def _wake_antigravity_via_focus() -> tuple[bool, str, bool]:
+    """Wake, unminimize, and focus Antigravity via `antigravity://focus`.
+
+    Returns `(ok, message, cold_started)`.
+    """
+    pid = _find_antigravity_main_pid()
+    was_running = pid is not None
+    if pid is not None:
+        ok_pid, _ = _send_url_to_pid(pid, ANTIGRAVITY_FOCUS_URL)
+        if ok_pid:
+            return True, "ok", False
+
+    bundle = _bundle_id("antigravity")
+    ok, msg = _run_open(["/usr/bin/open", "-b", bundle, ANTIGRAVITY_FOCUS_URL])
+    if not ok and os.path.isdir(ANTIGRAVITY_APP_PATH):
+        ok, msg = _run_open(
+            ["/usr/bin/open", "-a", ANTIGRAVITY_APP_PATH, ANTIGRAVITY_FOCUS_URL]
+        )
+    return ok, msg, not was_running
+
+
+def _open_antigravity(
+    session_id: str,
+    cwd: str,
+    title: str,
+    *,
+    defer_native_ui: bool = False,
+) -> dict[str, Any]:
+    exact_title = _resolve_antigravity_exact_title(session_id, title)
+    if defer_native_ui:
+        return {
+            "ok": True,
+            "action": "native_antigravity_open",
+            "target": ANTIGRAVITY_FOCUS_URL,
+            "native_payload": {
+                "tool": "antigravity",
+                "session_id": session_id,
+                "title": exact_title,
+                "cwd": cwd,
+            },
+            "message": "正在唤起 Antigravity 并定位会话…",
+        }
+
+    helper_result = _run_antigravity_opener_helper(
+        session_id=session_id,
+        title=exact_title,
+        cwd=cwd,
+    )
+    if helper_result is not None:
+        return helper_result
+
+    if exact_title:
+        copy_to_clipboard(exact_title)
+    ok, msg, cold_started = _wake_antigravity_via_focus()
     return {
         "ok": ok,
-        "message": "已打开 Antigravity 对应工作区（会话标题已复制，可直接粘贴定位）"
+        "message": "已唤起 Antigravity 窗口并复制会话标题（按 ⌘K 粘贴回车定位）"
         if ok
         else msg,
-        "action": "open_workspace",
-        "target": target_dir or "Antigravity.app",
+        "action": "focus_and_copy",
+        "target": ANTIGRAVITY_FOCUS_URL,
+        "cold_started": cold_started,
     }
 
 
@@ -490,7 +679,11 @@ _TOOL_LAUNCHERS: dict[str, LauncherFn] = {
 }
 
 
-def open_verified_session_locally(session: dict[str, Any]) -> dict[str, Any]:
+def open_verified_session_locally(
+    session: dict[str, Any],
+    *,
+    defer_native_ui: bool = False,
+) -> dict[str, Any]:
     tool = str(session.get("tool") or "")
     session_id = str(session.get("session_id") or "")
     cwd = str(session.get("cwd") or "")
@@ -511,6 +704,11 @@ def open_verified_session_locally(session: dict[str, Any]) -> dict[str, Any]:
             "action": "open_url",
             "target": external_url,
         }
+
+    if tool == "antigravity":
+        return _open_antigravity(
+            session_id, cwd, title, defer_native_ui=defer_native_ui
+        )
 
     handler = _TOOL_LAUNCHERS.get(tool)
     if handler is None:

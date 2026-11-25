@@ -26,7 +26,8 @@ bash "$PROJECT_DIR/scripts/package_macos.sh" \
 
 mkdir -p "$PROJECT_DIR/macos/bin"
 cp "$APP_BUNDLE/Contents/MacOS/send_url_to_pid" "$PROJECT_DIR/macos/bin/send_url_to_pid"
-chmod +x "$PROJECT_DIR/macos/bin/send_url_to_pid"
+cp "$APP_BUNDLE/Contents/MacOS/open_antigravity_session" "$PROJECT_DIR/macos/bin/open_antigravity_session"
+chmod +x "$PROJECT_DIR/macos/bin/send_url_to_pid" "$PROJECT_DIR/macos/bin/open_antigravity_session"
 
 echo "==> [2/4] Running initial incremental index & iCloud export"
 (cd "$PROJECT_DIR" && /usr/bin/python3 -B -m hub.server --sync-once)
@@ -58,6 +59,8 @@ cat > "$PLIST_PATH" <<EOF
     <string>1</string>
     <key>VIBE_HUB_SEND_URL_BIN</key>
     <string>$APP_BUNDLE/Contents/MacOS/send_url_to_pid</string>
+    <key>VIBE_HUB_ANTIGRAVITY_OPENER_BIN</key>
+    <string>$APP_BUNDLE/Contents/MacOS/open_antigravity_session</string>
   </dict>
   <key>WorkingDirectory</key>
   <string>$PROJECT_DIR</string>

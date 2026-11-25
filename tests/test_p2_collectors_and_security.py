@@ -700,6 +700,8 @@ class TestP2PathValidationAndCustomPort(unittest.TestCase):
         self.assertIn('"$DMG_PATH"', pkg_script)
         self.assertIn("BUILD_ID", pkg_script)
         self.assertIn("BackendUpgradeLogic.swift", pkg_script)
+        self.assertIn("AntigravityOpener.swift", pkg_script)
+        self.assertIn("open_antigravity_session", pkg_script)
         self.assertIn("AppUpdater.swift", pkg_script)
         self.assertIn("CHANGELOG.md", pkg_script)
 
@@ -1188,6 +1190,386 @@ print("SWIFT_UPGRADE_LOGIC_OK")
         self.assertGreater(update_pos, 0)
         self.assertGreater(theme_pos, update_pos)
         self.assertIn('id="updateModal"', html_text)
+
+    def test_antigravity_collector_fts_title_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "conversation_summaries.db"
+            con = sqlite3.connect(str(db_path))
+            try:
+                con.executescript(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT,
+                        preview TEXT,
+                        workspace_uris TEXT,
+                        last_modified_time TEXT
+                    );
+                    CREATE TABLE conversations_fts (
+                        conversation_id TEXT,
+                        chunk_index INTEGER,
+                        title TEXT,
+                        user_body TEXT,
+                        agent_body TEXT
+                    );
+                    INSERT INTO conversation_summaries VALUES (
+                        'agy-empty-title-1',
+                        '',
+                        'Reviewed Slack thread',
+                        '["file:///Users/dev/work/euka"]',
+                        '2026-11-24T19:20:57Z'
+                    );
+                    INSERT INTO conversations_fts VALUES (
+                        'agy-empty-title-1',
+                        0,
+                        'Chunk Fallback Title',
+                        'raw user message without title',
+                        'agent reply'
+                    );
+                    INSERT INTO conversations_fts VALUES (
+                        'agy-empty-title-1',
+                        -1,
+                        'Pylon Fix Slack Thread Review',
+                        '',
+                        ''
+                    );
+                    """
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            cache = collectors_mod.FileParseCache(initial_entries={})
+            items = collectors_mod.collect_antigravity_sessions(
+                "mac-ci", "CI-Mac", cache, db_paths=[db_path]
+            )
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["title"], "Pylon Fix Slack Thread Review")
+            self.assertEqual(items[0]["cwd"], "/Users/dev/work/euka")
+
+            # Launcher exact-title resolver should also recover the FTS header title
+            resolved = launcher_mod._resolve_antigravity_exact_title(
+                "agy-empty-title-1", "stale fallback", db_paths=[db_path]
+            )
+            self.assertEqual(resolved, "Pylon Fix Slack Thread Review")
+
+    def test_antigravity_launcher_native_defer_helper_and_focus_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "conversation_summaries.db"
+            con = sqlite3.connect(str(db_path))
+            try:
+                con.executescript(
+                    """
+                    CREATE TABLE conversation_summaries (
+                        conversation_id TEXT PRIMARY KEY,
+                        title TEXT
+                    );
+                    INSERT INTO conversation_summaries VALUES (
+                        '6c10d37b-110d-4acf-8325-795f935b29ef',
+                        'Pylon Fix Slack Thread Review'
+                    );
+                    """
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            session = {
+                "tool": "antigravity",
+                "session_id": "6c10d37b-110d-4acf-8325-795f935b29ef",
+                "cwd": "/Users/dev/work/euka",
+                "title": "Stale Indexed Title",
+            }
+
+            orig_resolve = launcher_mod._resolve_antigravity_exact_title
+
+            def resolve_from_tmp(sid: str, fb: str) -> str:
+                return orig_resolve(sid, fb, db_paths=[db_path])
+
+            with mock.patch.object(
+                launcher_mod,
+                "_resolve_antigravity_exact_title",
+                side_effect=resolve_from_tmp,
+            ):
+                # 1. Native app defer mode returns exact DB title payload without running subprocess
+                deferred = launcher_mod.open_verified_session_locally(
+                    session, defer_native_ui=True
+                )
+                self.assertTrue(deferred["ok"])
+                self.assertEqual(deferred["action"], "native_antigravity_open")
+                self.assertEqual(deferred["target"], "antigravity://focus")
+                self.assertEqual(
+                    deferred["native_payload"]["title"],
+                    "Pylon Fix Slack Thread Review",
+                )
+
+                # 2. Helper binary env override executes and returns structured JSON result
+                fake_helper = root / "open_antigravity_session"
+                fake_helper.write_text(
+                    "#!/bin/sh\n"
+                    'printf \'{"ok":true,"status":"opened","action":"fastpick_open",'
+                    '"message":"已唤起 Antigravity 并打开对应会话","target":"antigravity://focus",'
+                    '"needs_accessibility":false,"cold_started":false,"matched_index":0}\\n\'\n',
+                    encoding="utf-8",
+                )
+                fake_helper.chmod(0o755)
+                with mock.patch.dict(
+                    os.environ, {"VIBE_HUB_ANTIGRAVITY_OPENER_BIN": str(fake_helper)}
+                ):
+                    self.assertEqual(
+                        launcher_mod._find_antigravity_opener_helper(), str(fake_helper)
+                    )
+                    via_helper = launcher_mod.open_verified_session_locally(session)
+                self.assertTrue(via_helper["ok"])
+                self.assertEqual(via_helper["action"], "fastpick_open")
+                self.assertEqual(via_helper["status"], "opened")
+
+                # 3. Fallback when helper missing & Antigravity running -> send_url_to_pid(antigravity://focus)
+                sent_urls: list[tuple[int, str]] = []
+                copied: list[str] = []
+                with mock.patch.object(
+                    launcher_mod, "_find_antigravity_opener_helper", return_value=None
+                ), mock.patch.object(
+                    launcher_mod, "_find_antigravity_main_pid", return_value=543
+                ), mock.patch.object(
+                    launcher_mod,
+                    "_send_url_to_pid",
+                    side_effect=lambda pid, url: (sent_urls.append((pid, url)) or True, "ok"),
+                ), mock.patch.object(
+                    launcher_mod, "copy_to_clipboard", side_effect=copied.append
+                ):
+                    fb_running = launcher_mod.open_verified_session_locally(session)
+                self.assertTrue(fb_running["ok"])
+                self.assertEqual(fb_running["action"], "focus_and_copy")
+                self.assertFalse(fb_running["cold_started"])
+                self.assertEqual(sent_urls, [(543, "antigravity://focus")])
+                self.assertEqual(copied, ["Pylon Fix Slack Thread Review"])
+
+                # 4. Fallback when Antigravity is NOT running -> open -b com.google.antigravity antigravity://focus
+                open_cmds: list[list[str]] = []
+                with mock.patch.object(
+                    launcher_mod, "_find_antigravity_opener_helper", return_value=None
+                ), mock.patch.object(
+                    launcher_mod, "_find_antigravity_main_pid", return_value=None
+                ), mock.patch.object(
+                    launcher_mod,
+                    "_run_open",
+                    side_effect=lambda args: (open_cmds.append(args) or True, "ok"),
+                ), mock.patch.object(launcher_mod, "copy_to_clipboard"):
+                    fb_cold = launcher_mod.open_verified_session_locally(session)
+                self.assertTrue(fb_cold["ok"])
+                self.assertTrue(fb_cold["cold_started"])
+                self.assertEqual(
+                    open_cmds,
+                    [["/usr/bin/open", "-b", "com.google.antigravity", "antigravity://focus"]],
+                )
+
+    def test_api_open_forwards_defer_native_ui_for_verified_antigravity_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = config_mod.HubPaths.from_state_dir(
+                root / "state", icloud_root=root / "no-icloud"
+            )
+            store = storage_mod.SessionHubStore(local_only=True, paths=paths)
+            seeded = collectors_mod.build_session_record(
+                machine_id="mac-ci",
+                machine_name="CI-Mac",
+                tool="antigravity",
+                session_id="6c10d37b-110d-4acf-8325-795f935b29ef",
+                title="Pylon Fix Slack Thread Review",
+                cwd="/Users/dev/work/euka",
+                created_at=1000,
+                updated_at=2000,
+                search_text="Pylon Fix Slack Thread Review",
+            )
+            with mock.patch.object(
+                storage_mod,
+                "collect_all_local_sessions",
+                return_value=[seeded],
+            ):
+                store.sync_now(force_local=True)
+            verified_uid = seeded["uid"]
+
+            srv = server_mod.create_http_server(store, host="127.0.0.1", port=0)
+            t = threading.Thread(
+                target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+            )
+            t.start()
+            port = srv.server_port
+            try:
+                # 1. Verified Antigravity UID with defer_native_ui=True returns native_antigravity_open
+                req = Request(
+                    f"http://127.0.0.1:{port}/api/open",
+                    data=json.dumps(
+                        {"uid": verified_uid, "defer_native_ui": True}
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Vibe-Hub": "1",
+                        "Host": f"127.0.0.1:{port}",
+                        "Origin": f"http://127.0.0.1:{port}",
+                    },
+                    method="POST",
+                )
+                with mock.patch.object(
+                    launcher_mod,
+                    "_resolve_antigravity_exact_title",
+                    return_value="Pylon Fix Slack Thread Review",
+                ):
+                    with urlopen(req, timeout=2) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["action"], "native_antigravity_open")
+                self.assertEqual(
+                    data["native_payload"]["title"], "Pylon Fix Slack Thread Review"
+                )
+
+                # 2. Unknown UID must still be rejected with 404
+                bad_req = Request(
+                    f"http://127.0.0.1:{port}/api/open",
+                    data=json.dumps(
+                        {"uid": "mac-test:antigravity:does-not-exist", "defer_native_ui": True}
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Vibe-Hub": "1",
+                        "Host": f"127.0.0.1:{port}",
+                        "Origin": f"http://127.0.0.1:{port}",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(HTTPError) as ctx:
+                    urlopen(bad_req, timeout=2)
+                self.assertEqual(ctx.exception.code, 404)
+
+                # 3. /jump HTML page wires vibeHubLauncher bridge for native app opens
+                with urlopen(
+                    f"http://127.0.0.1:{port}/jump?uid={verified_uid}", timeout=2
+                ) as resp:
+                    jump_html = resp.read().decode("utf-8")
+                self.assertIn("vibeHubLauncher", jump_html)
+                self.assertIn("defer_native_ui", jump_html)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                store.close()
+
+    def test_swift_antigravity_opener_logic_on_macos(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("macOS-only Swift test")
+        swiftc = shutil.which("swiftc")
+        if not swiftc:
+            self.skipTest("swiftc not available")
+
+        repo_root = Path(__file__).resolve().parent.parent
+        opener_file = repo_root / "macos" / "AntigravityOpener.swift"
+        self.assertTrue(opener_file.is_file())
+
+        driver = r'''
+import Foundation
+
+func expect(_ cond: Bool, _ msg: String) {
+    if !cond {
+        fputs("FAIL: \(msg)\n", stderr)
+        exit(1)
+    }
+}
+
+// 1. Query normalization
+expect(normalizeAntigravitySearchQuery("  Pylon   Fix\nSlack\tThread  ") == "Pylon Fix Slack Thread", "collapses whitespace")
+expect(normalizeAntigravitySearchQuery("   ", fallbackSessionId: "abc-123") == "abc-123", "falls back to session id")
+
+// 2. Placeholder & FastPick classification (must reject chat composer!)
+expect(classifyAntigravityFastPickPlaceholder("Search for conversations...", hasFastPickAncestor: false) == .conversations, "conversations mode")
+expect(classifyAntigravityFastPickPlaceholder("Search conversations, commands, and code...", hasFastPickAncestor: false) == .unified, "unified mode")
+expect(classifyAntigravityFastPickPlaceholder("Select category to search...", hasFastPickAncestor: false) == .unified, "category mode")
+expect(classifyAntigravityFastPickPlaceholder("Search for commands...", hasFastPickAncestor: true) == .otherCategory, "other category with ancestor")
+expect(classifyAntigravityFastPickPlaceholder("Ask anything...", hasFastPickAncestor: false) == nil, "chat box must never match")
+expect(classifyAntigravityFastPickPlaceholder("Search files...", hasFastPickAncestor: false) == nil, "generic search without fastpick ancestor must not match")
+expect(classifyAntigravityFastPickPlaceholder("Custom localized text", hasFastPickAncestor: true) == .unknownFastPick, "fastpick ancestor fallback")
+
+// 3. Paste payload prefix handling
+expect(buildAntigravityPastePayload(query: "Pylon Fix Slack Thread Review", mode: .conversations) == "Pylon Fix Slack Thread Review", "conversations mode avoids prefix")
+expect(buildAntigravityPastePayload(query: "Pylon Fix Slack Thread Review", mode: .unified) == "conversations:Pylon Fix Slack Thread Review", "unified mode adds prefix")
+expect(buildAntigravityPastePayload(query: "> fix shell prompt", mode: .conversations) == "conversations:> fix shell prompt", "reserved prefix escaped")
+expect(buildAntigravityPastePayload(query: "files: cleanup", mode: .conversations) == "conversations:files: cleanup", "files prefix escaped")
+
+// 4. Workspace hint extraction
+expect(extractWorkspaceHint(fromCwd: "/Users/alan/EukaWrok/worktrees/gemini/work2/euka") == "euka", "extracts basename")
+expect(extractWorkspaceHint(fromCwd: "/") == "", "ignores root")
+expect(extractWorkspaceHint(fromCwd: "") == "", "empty cwd")
+
+// 5. Candidate matching & workspace disambiguation
+let dupItems = [
+    AntigravityCandidateItem(index: 0, primaryText: "Fix Auth Redirect", fullText: "Fix Auth Redirect backend-api", isHighlighted: true),
+    AntigravityCandidateItem(index: 1, primaryText: "Fix Auth Redirect", fullText: "Fix Auth Redirect euka", isHighlighted: false),
+]
+expect(selectBestAntigravityCandidate(items: dupItems, query: "Fix Auth Redirect", workspaceHint: "euka") == 1, "workspace hint breaks duplicate title tie")
+expect(selectBestAntigravityCandidate(items: dupItems, query: "Fix Auth Redirect", workspaceHint: "") == 0, "highlighted/first wins when no hint")
+
+let truncatedItems = [
+    AntigravityCandidateItem(index: 0, primaryText: "Investigate SQLite Connection Pool...", fullText: "Investigate SQLite Connection Pool... vibe-session-hub", isHighlighted: true),
+]
+expect(selectBestAntigravityCandidate(items: truncatedItems, query: "Investigate SQLite Connection Pool Leak in WAL Mode", workspaceHint: "vibe-session-hub") == 0, "handles ellipsis-truncated display title")
+
+let unrelatedItems = [
+    AntigravityCandidateItem(index: 0, primaryText: "No results found", fullText: "No results found", isHighlighted: false),
+    AntigravityCandidateItem(index: 1, primaryText: "Show 12 more...", fullText: "Show 12 more...", isHighlighted: false),
+    AntigravityCandidateItem(index: 2, primaryText: "Completely Different Thread", fullText: "Completely Different Thread other-repo", isHighlighted: true),
+]
+expect(selectBestAntigravityCandidate(items: unrelatedItems, query: "Pylon Fix Slack Thread Review", workspaceHint: "euka") == nil, "must never select unrelated item")
+
+// 6. Result JSON encoding
+let res = AntigravityOpenResult(
+    ok: true,
+    status: "opened",
+    action: "fastpick_open",
+    message: "ok",
+    target: antigravityFocusURL,
+    needsAccessibility: false,
+    coldStarted: false,
+    matchedIndex: 0
+)
+let jsonStr = res.toJSONString()
+expect(jsonStr.contains("\"fastpick_open\""), "encodes action")
+expect(jsonStr.contains("\"needs_accessibility\":false"), "encodes snake_case keys")
+
+print("SWIFT_ANTIGRAVITY_OPENER_OK")
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            driver_path = Path(tmp) / "main.swift"
+            bin_path = Path(tmp) / "test_antigravity_opener"
+            driver_path.write_text(driver, encoding="utf-8")
+            subprocess.run(
+                [
+                    swiftc,
+                    "-framework",
+                    "AppKit",
+                    "-framework",
+                    "ApplicationServices",
+                    "-framework",
+                    "Carbon",
+                    "-framework",
+                    "CoreServices",
+                    str(opener_file),
+                    str(driver_path),
+                    "-o",
+                    str(bin_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            run_res = subprocess.run(
+                [str(bin_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertIn("SWIFT_ANTIGRAVITY_OPENER_OK", run_res.stdout)
 
 
 if __name__ == "__main__":

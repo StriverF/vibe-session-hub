@@ -260,16 +260,21 @@ jobs:
           lipo -info "$APP/Contents/MacOS/VibeSessionHub" | grep -q "x86_64"
           lipo -info "$APP/Contents/MacOS/send_url_to_pid" | grep -q "arm64"
           lipo -info "$APP/Contents/MacOS/send_url_to_pid" | grep -q "x86_64"
+          lipo -info "$APP/Contents/MacOS/open_antigravity_session" | grep -q "arm64"
+          lipo -info "$APP/Contents/MacOS/open_antigravity_session" | grep -q "x86_64"
 
           codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/send_url_to_pid"
+          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/open_antigravity_session"
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
           codesign -d --entitlements :- "$APP/Contents/MacOS/send_url_to_pid" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
+          codesign -d --entitlements :- "$APP/Contents/MacOS/open_antigravity_session" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
 
           if [ "$DEVELOPER_ID" = "true" ]; then
             codesign --verify --verbose=2 "dist/$DMG_NAME"
             codesign -dv "$APP" 2>&1 | grep -q "runtime"
             codesign -dv "$APP/Contents/MacOS/send_url_to_pid" 2>&1 | grep -q "runtime"
+            codesign -dv "$APP/Contents/MacOS/open_antigravity_session" 2>&1 | grep -q "runtime"
           fi
 
           if [ "$NOTARIZED" = "true" ]; then
