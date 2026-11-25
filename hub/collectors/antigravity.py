@@ -71,10 +71,26 @@ def collect_antigravity_sessions(
             ).fetchall()
 
             fts_map: dict[str, tuple[str, str]] = {}
+            fts_title_map: dict[str, str] = {}
             try:
-                fts_rows = con.execute(
-                    "SELECT conversation_id, user_body, agent_body FROM conversations_fts"
-                ).fetchall()
+                fts_cols = {
+                    str(col[1])
+                    for col in con.execute("PRAGMA table_info(conversations_fts)").fetchall()
+                }
+                has_fts_title = "title" in fts_cols
+                has_chunk_index = "chunk_index" in fts_cols
+                if has_fts_title and has_chunk_index:
+                    fts_rows = con.execute(
+                        "SELECT conversation_id, chunk_index, title, user_body, agent_body FROM conversations_fts"
+                    ).fetchall()
+                elif has_fts_title:
+                    fts_rows = con.execute(
+                        "SELECT conversation_id, title, user_body, agent_body FROM conversations_fts"
+                    ).fetchall()
+                else:
+                    fts_rows = con.execute(
+                        "SELECT conversation_id, user_body, agent_body FROM conversations_fts"
+                    ).fetchall()
                 for fr in fts_rows:
                     cid = str(fr["conversation_id"])
                     prev_u, prev_a = fts_map.get(cid, ("", ""))
@@ -82,6 +98,13 @@ def collect_antigravity_sessions(
                         (prev_u + "\n" + str(fr["user_body"] or "")).strip(),
                         (prev_a + "\n" + str(fr["agent_body"] or "")).strip(),
                     )
+                    if has_fts_title:
+                        raw_ft = str(fr["title"] or "").strip()
+                        if raw_ft and (
+                            cid not in fts_title_map
+                            or (has_chunk_index and fr["chunk_index"] == -1)
+                        ):
+                            fts_title_map[cid] = raw_ft
             except Exception as exc:
                 logger.debug("Antigravity FTS table skipped (%s): %s", db_path, exc)
         except Exception as exc:
@@ -105,9 +128,10 @@ def collect_antigravity_sessions(
             clean_a = clean_text(abody)
             preview = clean_text(str(row["preview"] or clean_a))[:MAX_SNIPPET_CHARS]
             first_prompt = clean_u[:MAX_SNIPPET_CHARS]
-            title = clean_text(str(row["title"] or first_prompt or preview or cid))[
-                :110
-            ]
+            fts_title = fts_title_map.get(cid, "")
+            title = clean_text(
+                str(row["title"] or fts_title or first_prompt or preview or cid)
+            )[:110]
             cwd = _extract_primary_workspace(str(row["workspace_uris"] or ""))
             updated_at = parse_iso_to_ms(row["last_modified_time"])
 

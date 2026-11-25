@@ -80,10 +80,14 @@ jobs:
           lipo -info "$APP/Contents/MacOS/VibeSessionHub" | grep -q "x86_64"
           lipo -info "$APP/Contents/MacOS/send_url_to_pid" | tee /dev/stderr | grep -q "arm64"
           lipo -info "$APP/Contents/MacOS/send_url_to_pid" | grep -q "x86_64"
+          lipo -info "$APP/Contents/MacOS/open_antigravity_session" | tee /dev/stderr | grep -q "arm64"
+          lipo -info "$APP/Contents/MacOS/open_antigravity_session" | grep -q "x86_64"
           codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/send_url_to_pid"
+          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/open_antigravity_session"
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
           codesign -d --entitlements :- "$APP/Contents/MacOS/send_url_to_pid" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
+          codesign -d --entitlements :- "$APP/Contents/MacOS/open_antigravity_session" 2>/dev/null | grep -q "com.apple.security.automation.apple-events"
           /usr/libexec/PlistBuddy -c 'Print :NSAppleEventsUsageDescription' "$APP/Contents/Info.plist" >/dev/null
 
       - name: Smoke-test bundled runtime on custom port

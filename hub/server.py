@@ -168,16 +168,64 @@ def _render_jump_html(
   </div>
   <script>
     const btn = document.getElementById("confirmOpenBtn");
+    const pendingNative = new Map();
+    let nativeReqSeq = 0;
+    window.__vibeHubResolveLauncher = (reqId, payload) => {{
+      const entry = pendingNative.get(String(reqId));
+      if (!entry) return;
+      pendingNative.delete(String(reqId));
+      clearTimeout(entry.timer);
+      entry.resolve(payload);
+    }};
+    function callNativeAntigravity(payload) {{
+      return new Promise((resolve) => {{
+        const bridge = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vibeHubLauncher;
+        if (!bridge) {{ resolve(null); return; }}
+        const reqId = "jump_" + (++nativeReqSeq);
+        const timer = setTimeout(() => {{
+          pendingNative.delete(reqId);
+          resolve(null);
+        }}, 20000);
+        pendingNative.set(reqId, {{ resolve, timer }});
+        try {{
+          bridge.postMessage({{
+            action: "openAntigravity",
+            requestId: reqId,
+            sessionId: payload.session_id || "",
+            title: payload.title || "",
+            cwd: payload.cwd || ""
+          }});
+        }} catch (_err) {{
+          pendingNative.delete(reqId);
+          clearTimeout(timer);
+          resolve(null);
+        }}
+      }});
+    }}
     if (btn) {{
       btn.addEventListener("click", async () => {{
         btn.disabled = true;
+        const hasNative = Boolean(window.__VIBE_HUB_NATIVE__ && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.vibeHubLauncher);
         const res = await fetch("/api/open", {{
           method: "POST",
           headers: {{ "Content-Type": "application/json", "X-Vibe-Hub": "1" }},
-          body: JSON.stringify({{ uid: btn.dataset.uid }})
+          body: JSON.stringify({{ uid: btn.dataset.uid, defer_native_ui: hasNative }})
         }});
-        const data = await res.json();
-        document.getElementById("subText").textContent = data.message || "已发送打开请求";
+        let data = await res.json();
+        if (data && data.action === "native_antigravity_open" && data.native_payload) {{
+          const nativeRes = await callNativeAntigravity(data.native_payload);
+          if (nativeRes && typeof nativeRes === "object") {{
+            data = nativeRes;
+          }} else {{
+            const fbRes = await fetch("/api/open", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json", "X-Vibe-Hub": "1" }},
+              body: JSON.stringify({{ uid: btn.dataset.uid, defer_native_ui: false }})
+            }});
+            data = await fbRes.json();
+          }}
+        }}
+        document.getElementById("subText").textContent = (data && data.message) || "已发送打开请求";
         btn.disabled = false;
       }});
     }}
@@ -542,6 +590,7 @@ class HubRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/open":
             uid = str(body.get("uid") or "").strip()
+            defer_native_ui = bool(body.get("defer_native_ui", False))
             session = store.get_session_by_uid(uid) if uid else None
             if session is None:
                 self._send_json(
@@ -549,7 +598,9 @@ class HubRequestHandler(BaseHTTPRequestHandler):
                     status=404,
                 )
                 return
-            res = open_verified_session_locally(session)
+            res = open_verified_session_locally(
+                session, defer_native_ui=defer_native_ui
+            )
             self._send_json(res)
             return
 

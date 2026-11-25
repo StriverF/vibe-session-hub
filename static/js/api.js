@@ -52,8 +52,68 @@ export function saveThemePreference(themeId) {
   return postApi("/api/preferences", { theme: themeId });
 }
 
-export function openSession(uid) {
-  return postApi("/api/open", { uid });
+const pendingNativeLauncher = new Map();
+let nativeLauncherSeq = 0;
+
+if (typeof window !== "undefined") {
+  window.__vibeHubResolveLauncher = (requestId, payload) => {
+    const entry = pendingNativeLauncher.get(String(requestId));
+    if (!entry) return;
+    pendingNativeLauncher.delete(String(requestId));
+    clearTimeout(entry.timer);
+    entry.resolve(payload);
+  };
+}
+
+function getNativeLauncherBridge() {
+  if (typeof window === "undefined" || !window.__VIBE_HUB_NATIVE__) {
+    return null;
+  }
+  return window.webkit?.messageHandlers?.vibeHubLauncher || null;
+}
+
+function invokeNativeAntigravityOpen(payload) {
+  const bridge = getNativeLauncherBridge();
+  if (!bridge) {
+    return Promise.resolve(null);
+  }
+  return new Promise((resolve) => {
+    const requestId = `native_${++nativeLauncherSeq}`;
+    const timer = setTimeout(() => {
+      pendingNativeLauncher.delete(requestId);
+      resolve(null);
+    }, 20000);
+    pendingNativeLauncher.set(requestId, { resolve, timer });
+    try {
+      bridge.postMessage({
+        action: "openAntigravity",
+        requestId,
+        sessionId: String(payload?.session_id || ""),
+        title: String(payload?.title || ""),
+        cwd: String(payload?.cwd || ""),
+      });
+    } catch {
+      pendingNativeLauncher.delete(requestId);
+      clearTimeout(timer);
+      resolve(null);
+    }
+  });
+}
+
+export async function openSession(uid) {
+  const hasNativeBridge = Boolean(getNativeLauncherBridge());
+  const res = await postApi("/api/open", {
+    uid,
+    defer_native_ui: hasNativeBridge,
+  });
+  if (res && res.action === "native_antigravity_open" && res.native_payload) {
+    const nativeRes = await invokeNativeAntigravityOpen(res.native_payload);
+    if (nativeRes && typeof nativeRes === "object") {
+      return nativeRes;
+    }
+    return postApi("/api/open", { uid, defer_native_ui: false });
+  }
+  return res;
 }
 
 export function addManualLink(payload) {
