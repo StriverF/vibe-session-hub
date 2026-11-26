@@ -198,6 +198,7 @@ export const els = {
   prBanner: document.getElementById("prBanner"),
   resultsList: document.getElementById("resultsList"),
   detailPane: document.getElementById("detailPane"),
+  currentMachineIcon: document.getElementById("currentMachineIcon"),
   currentMachineName: document.getElementById("currentMachineName"),
   machineBadgeBtn: document.getElementById("machineBadgeBtn"),
   syncMeta: document.getElementById("syncMeta"),

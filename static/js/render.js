@@ -1,4 +1,5 @@
 import { copyText } from "./api.js";
+import { getDeviceTypeLabel, renderDeviceIcon } from "./device-icons.js";
 import { canOpenRemoteDirectly, els, state } from "./state.js";
 import {
   buildCrossMacJumpUrl,
@@ -32,11 +33,23 @@ export function renderFilterPills() {
   const mHtml = [
     `<button class="filter-pill ${state.machineId === "" ? "active" : ""}" data-machine="">全部设备 (${total})</button>`,
     ...machines.map((m) => {
-      const tag = m.is_local
-        ? `💻 ${escapeHtml(m.machine_name)} · 本机`
-        : `🖥 ${escapeHtml(m.machine_name)}`;
+      const iconHtml = renderDeviceIcon(
+        m.machine_type,
+        m.machine_name,
+        "device-icon-sm",
+        { machineId: m.machine_id }
+      );
+      const label = m.is_local
+        ? `${escapeHtml(m.machine_name)} · 本机`
+        : escapeHtml(m.machine_name);
+      const modelTitle =
+        m.machine_model ||
+        getDeviceTypeLabel(m.machine_type, m.machine_name, m.machine_id);
       const active = state.machineId === m.machine_id ? "active" : "";
-      return `<button class="filter-pill ${active}" data-machine="${escapeHtml(m.machine_id)}">${tag} (${m.count})</button>`;
+      return `<button class="filter-pill ${active}" data-machine="${escapeHtml(m.machine_id)}" title="${escapeHtml(modelTitle)}">
+        ${iconHtml}
+        <span>${label} (${m.count})</span>
+      </button>`;
     }),
   ].join("");
   els.machineFilters.innerHTML = mHtml;
@@ -91,9 +104,15 @@ export function renderList() {
   els.resultsList.innerHTML = state.items
     .map((item, idx) => {
       const selected = idx === state.selectedIndex ? "selected" : "";
+      const deviceIconHtml = renderDeviceIcon(
+        item.machine_type,
+        item.machine_name,
+        "device-icon-xs",
+        { machineId: item.machine_id }
+      );
       const locBadge = item.is_local
-        ? `<span class="loc-badge loc-local">本机 · ${escapeHtml(item.machine_name)}</span>`
-        : `<span class="loc-badge loc-remote">🖥 ${escapeHtml(item.machine_name)}</span>`;
+        ? `<span class="loc-badge loc-local">${deviceIconHtml}<span>本机 · ${escapeHtml(item.machine_name)}</span></span>`
+        : `<span class="loc-badge loc-remote">${deviceIconHtml}<span>${escapeHtml(item.machine_name)}</span></span>`;
 
       const prsHtml = (item.prs || [])
         .slice(0, 3)
@@ -177,7 +196,8 @@ export function renderDetail({ onOpenSession, onOpenLinkModal }) {
             <span>${escapeHtml(item.tool_label)}</span>
           </span>
           <span class="loc-badge ${item.is_local ? "loc-local" : "loc-remote"}">
-            ${item.is_local ? `💻 本机 · ${escapeHtml(item.machine_name)}` : `🖥 跨设备 · ${escapeHtml(item.machine_name)}`}
+            ${renderDeviceIcon(item.machine_type, item.machine_name, "device-icon-xs", { machineId: item.machine_id })}
+            <span>${item.is_local ? `本机 · ${escapeHtml(item.machine_name)}` : `跨设备 · ${escapeHtml(item.machine_name)}`}</span>
           </span>
           ${prsLinks}
         </div>

@@ -28,6 +28,7 @@ from .config import (
     update_machine_name,
     update_preferences,
 )
+from .device_icons import ALLOWED_DEVICE_ICON_TYPES, get_device_icon_png
 from .launcher import (
     APPROVED_DEEP_LINK_SCHEMES,
     build_native_deep_link,
@@ -402,11 +403,37 @@ class HubRequestHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
 
+    def _handle_device_icon(self, path: str, head_only: bool = False) -> None:
+        prefix = "/api/device-icons/"
+        rel = path[len(prefix) :]
+        if not rel.endswith(".png"):
+            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+            return
+        device_type = rel[:-4].strip().lower()
+        if device_type not in ALLOWED_DEVICE_ICON_TYPES:
+            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+            return
+        png_bytes = get_device_icon_png(device_type)
+        if not png_bytes:
+            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(png_bytes)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(png_bytes)
+
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/api/health":
             self._send_json(self._build_health_payload(), head_only=True)
+            return
+        if path.startswith("/api/device-icons/"):
+            self._handle_device_icon(path, head_only=True)
             return
         if path.startswith("/api/"):
             self.send_error(HTTPStatus.METHOD_NOT_ALLOWED, "Method Not Allowed")
@@ -437,6 +464,10 @@ class HubRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/health":
             self._send_json(self._build_health_payload())
+            return
+
+        if path.startswith("/api/device-icons/"):
+            self._handle_device_icon(path, head_only=False)
             return
 
         if path == "/api/tools":

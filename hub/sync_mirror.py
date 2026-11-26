@@ -153,27 +153,39 @@ class ICloudSyncMirror:
             self.icloud_status = "synced_via_app"
 
     def export_local_shard(
-        self, machine_id: str, machine_name: str, sessions: list[dict[str, Any]]
+        self,
+        machine_id: str,
+        machine_name: str,
+        sessions: list[dict[str, Any]],
+        machine_type: str = "",
+        machine_model: str = "",
     ) -> bool:
-        lines = [
-            json.dumps(
-                {
-                    "_meta": True,
-                    "machine_id": machine_id,
-                    "machine_name": machine_name,
-                    "exported_at": int(time.time() * 1000),
-                },
-                ensure_ascii=False,
-            )
-        ]
+        meta_payload: dict[str, Any] = {
+            "_meta": True,
+            "machine_id": machine_id,
+            "machine_name": machine_name,
+            "exported_at": int(time.time() * 1000),
+        }
+        if machine_type:
+            meta_payload["machine_type"] = machine_type
+        if machine_model:
+            meta_payload["machine_model"] = machine_model
+
+        lines = [json.dumps(meta_payload, ensure_ascii=False)]
         for s in sessions:
             s_copy = dict(s)
             s_copy["machine_name"] = machine_name
+            if machine_type:
+                s_copy["machine_type"] = machine_type
             lines.append(json.dumps(s_copy, ensure_ascii=False))
 
         # Hash content excluding exported_at so identical payloads don't churn disk or iCloud.
         payload_digest = hashlib.sha256(
-            ("\n".join([machine_id, machine_name, *lines[1:]])).encode("utf-8")
+            (
+                "\n".join(
+                    [machine_id, machine_name, machine_type, machine_model, *lines[1:]]
+                )
+            ).encode("utf-8")
         ).hexdigest()
         shard_path = self.paths.nodes_dir / f"{machine_id}.jsonl"
         if not self._last_export_digest and shard_path.is_file():
@@ -188,11 +200,19 @@ class ICloudSyncMirror:
                         and meta.get("_meta")
                         and meta.get("machine_id") == machine_id
                         and meta.get("machine_name") == machine_name
+                        and str(meta.get("machine_type") or "") == machine_type
+                        and str(meta.get("machine_model") or "") == machine_model
                     ):
                         self._last_export_digest = hashlib.sha256(
                             (
                                 "\n".join(
-                                    [machine_id, machine_name, *existing_lines[1:]]
+                                    [
+                                        machine_id,
+                                        machine_name,
+                                        machine_type,
+                                        machine_model,
+                                        *existing_lines[1:],
+                                    ]
                                 )
                             ).encode("utf-8")
                         ).hexdigest()

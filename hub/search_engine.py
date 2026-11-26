@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from .config import normalize_machine_type
 from .git_pr_resolver import (
     parse_pr_query,
     resolve_pr_from_local_git,
@@ -90,7 +91,16 @@ def row_to_dict(
     local_machine_id: str,
     match_reason: str = "",
     matched_snippet: str = "",
+    local_machine_type: str = "",
 ) -> dict[str, Any]:
+    is_local = row["machine_id"] == local_machine_id
+    row_mtype = str(row["machine_type"] or "") if "machine_type" in row.keys() else ""
+    preferred_mtype = local_machine_type if (is_local and local_machine_type) else row_mtype
+    machine_type = normalize_machine_type(
+        preferred_mtype,
+        machine_name=str(row["machine_name"] or ""),
+        machine_id=str(row["machine_id"] or ""),
+    )
     return {
         "uid": row["uid"],
         "session_id": row["session_id"],
@@ -98,7 +108,8 @@ def row_to_dict(
         "tool_label": row["tool_label"],
         "machine_id": row["machine_id"],
         "machine_name": row["machine_name"],
-        "is_local": row["machine_id"] == local_machine_id,
+        "machine_type": machine_type,
+        "is_local": is_local,
         "title": row["title"],
         "first_prompt": row["first_prompt"],
         "summary": row["summary"],
@@ -164,23 +175,66 @@ class SearchEngine:
         if not row:
             return None
         minfo = self._get_machine_info()
-        return row_to_dict(row, local_machine_id=minfo["machine_id"])
+        return row_to_dict(
+            row,
+            local_machine_id=minfo["machine_id"],
+            local_machine_type=str(minfo.get("machine_type") or ""),
+        )
 
     def get_facets(
         self, sync_root: str, health: dict[str, Any]
     ) -> dict[str, Any]:
         minfo = self._get_machine_info()
+        local_mid = minfo["machine_id"]
+        local_mtype = str(minfo.get("machine_type") or "")
+        local_mmodel = str(minfo.get("machine_model") or "")
         with self._read_conn() as conn:
             tools = conn.execute(
                 "SELECT tool, tool_label, count(*) AS cnt FROM sessions GROUP BY tool ORDER BY cnt DESC"
             ).fetchall()
             machines = conn.execute(
-                "SELECT machine_id, MAX(machine_name) AS machine_name, count(*) AS cnt FROM sessions GROUP BY machine_id ORDER BY cnt DESC"
+                """
+                SELECT
+                    machine_id,
+                    MAX(machine_name) AS machine_name,
+                    COALESCE(
+                        MAX(CASE WHEN machine_type NOT IN ('', 'mac', 'shared') THEN machine_type END),
+                        MAX(NULLIF(machine_type, '')),
+                        ''
+                    ) AS machine_type,
+                    count(*) AS cnt
+                FROM sessions
+                GROUP BY machine_id
+                ORDER BY cnt DESC
+                """
             ).fetchall()
             pr_count = conn.execute(
                 "SELECT count(*) FROM sessions WHERE pr_numbers != ''"
             ).fetchone()[0]
             total = conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
+        machine_facets: list[dict[str, Any]] = []
+        for r in machines:
+            is_local = r["machine_id"] == local_mid
+            preferred_mtype = (
+                local_mtype
+                if (is_local and local_mtype)
+                else str(r["machine_type"] or "")
+            )
+            mtype = normalize_machine_type(
+                preferred_mtype,
+                machine_name=str(r["machine_name"] or ""),
+                machine_id=str(r["machine_id"] or ""),
+            )
+            item: dict[str, Any] = {
+                "machine_id": r["machine_id"],
+                "machine_name": r["machine_name"],
+                "machine_type": mtype,
+                "is_local": is_local,
+                "count": r["cnt"],
+            }
+            if is_local and local_mmodel:
+                item["machine_model"] = local_mmodel
+            machine_facets.append(item)
         return {
             "current_machine": minfo,
             "sync_root": sync_root,
@@ -193,15 +247,7 @@ class SearchEngine:
                 {"tool": r["tool"], "label": r["tool_label"], "count": r["cnt"]}
                 for r in tools
             ],
-            "machines": [
-                {
-                    "machine_id": r["machine_id"],
-                    "machine_name": r["machine_name"],
-                    "is_local": r["machine_id"] == minfo["machine_id"],
-                    "count": r["cnt"],
-                }
-                for r in machines
-            ],
+            "machines": machine_facets,
         }
 
     def _get_candidate_repos(self, conn: sqlite3.Connection) -> list[str]:
@@ -626,7 +672,9 @@ class SearchEngine:
         limit: int = 80,
     ) -> dict[str, Any]:
         t0 = time.time()
-        local_mid = self._get_machine_info()["machine_id"]
+        minfo = self._get_machine_info()
+        local_mid = minfo["machine_id"]
+        local_mtype = str(minfo.get("machine_type") or "")
 
         where_clauses: list[str] = []
         base_params: list[Any] = []
@@ -649,7 +697,14 @@ class SearchEngine:
                     [*base_params, limit],
                 ).fetchall()
             return {
-                "items": [row_to_dict(r, local_machine_id=local_mid) for r in rows],
+                "items": [
+                    row_to_dict(
+                        r,
+                        local_machine_id=local_mid,
+                        local_machine_type=local_mtype,
+                    )
+                    for r in rows
+                ],
                 "resolved_pr": None,
                 "elapsed_ms": int((time.time() - t0) * 1000),
             }
@@ -686,6 +741,7 @@ class SearchEngine:
                     local_machine_id=local_mid,
                     match_reason=reason,
                     matched_snippet=snip,
+                    local_machine_type=local_mtype,
                 )
                 for _, r, reason, snip in ordered
             ],
