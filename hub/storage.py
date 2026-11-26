@@ -52,7 +52,7 @@ from .sync_mirror import (
 
 logger = logging.getLogger("vibe_session_hub.storage")
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 DEFAULT_READ_POOL_SIZE = 8
 
 
@@ -411,6 +411,7 @@ class SessionHubStore:
                     tool_label TEXT NOT NULL,
                     machine_id TEXT NOT NULL,
                     machine_name TEXT NOT NULL,
+                    machine_type TEXT NOT NULL DEFAULT '',
                     title TEXT NOT NULL,
                     first_prompt TEXT NOT NULL,
                     summary TEXT NOT NULL,
@@ -496,9 +497,20 @@ class SessionHubStore:
         return parse_node_shard(shard_path)
 
     def _export_local_shard(
-        self, machine_id: str, machine_name: str, sessions: list[dict[str, Any]]
+        self,
+        machine_id: str,
+        machine_name: str,
+        sessions: list[dict[str, Any]],
+        machine_type: str = "",
+        machine_model: str = "",
     ) -> bool:
-        return self._mirror.export_local_shard(machine_id, machine_name, sessions)
+        return self._mirror.export_local_shard(
+            machine_id,
+            machine_name,
+            sessions,
+            machine_type=machine_type,
+            machine_model=machine_model,
+        )
 
     def _mirror_with_icloud(self, machine_id: str) -> bool:
         return self._mirror.mirror(machine_id)
@@ -549,7 +561,13 @@ class SessionHubStore:
                     with self._db_write_lock:
                         parse_cache.flush_to_conn(self._write_conn)
                         self._write_conn.commit()
-                if self._export_local_shard(mid, mname, local_sessions):
+                if self._export_local_shard(
+                    mid,
+                    mname,
+                    local_sessions,
+                    machine_type=str(minfo.get("machine_type") or ""),
+                    machine_model=str(minfo.get("machine_model") or ""),
+                ):
                     dirty_shards.add(f"node:{mid}.jsonl")
                 self._last_local_scan_ms = now_ms
 

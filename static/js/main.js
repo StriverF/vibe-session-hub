@@ -29,6 +29,7 @@ import {
   initUpdater,
   renderUpdateControl,
 } from "./updater.js";
+import { getDeviceTypeLabel, renderDeviceIcon } from "./device-icons.js";
 import { buildCrossMacJumpUrl, showToast } from "./utils.js";
 
 async function loadFacets() {
@@ -48,7 +49,28 @@ async function loadFacets() {
   if (data.preferences?.theme) {
     applyThemeLocally(data.preferences.theme);
   }
-  els.currentMachineName.textContent = `${data.current_machine.machine_name} (本机)`;
+  const curMachine = data.current_machine || {};
+  els.currentMachineName.textContent = `${curMachine.machine_name} (本机)`;
+  if (els.currentMachineIcon) {
+    els.currentMachineIcon.innerHTML = renderDeviceIcon(
+      curMachine.machine_type,
+      curMachine.machine_name,
+      "device-icon-sm",
+      { machineId: curMachine.machine_id }
+    );
+  }
+  const modelLabel =
+    curMachine.machine_model ||
+    getDeviceTypeLabel(
+      curMachine.machine_type,
+      curMachine.machine_name,
+      curMachine.machine_id
+    );
+  if (els.machineBadgeBtn) {
+    els.machineBadgeBtn.title = modelLabel
+      ? `${modelLabel} · 点击修改当前电脑显示名称`
+      : "点击修改当前电脑显示名称";
+  }
   els.prTotalCount.textContent = data.with_pr_count;
   renderFilterPills();
 }

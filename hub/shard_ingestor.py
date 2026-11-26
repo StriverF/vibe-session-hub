@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .config import HubPaths
+from .config import HubPaths, normalize_machine_type
 from .tool_registry import get_tool_label
 
 logger = logging.getLogger("vibe_session_hub.shard_ingestor")
@@ -25,6 +25,7 @@ SESSIONS_COLUMNS = (
     "tool_label",
     "machine_id",
     "machine_name",
+    "machine_type",
     "title",
     "first_prompt",
     "summary",
@@ -95,7 +96,10 @@ def load_manual_links(
 
 def parse_node_shard(shard_path: Path) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
+    shard_machine_id = ""
     shard_machine_name = ""
+    shard_machine_type = ""
+    shard_machine_model = ""
     try:
         with shard_path.open("r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -104,13 +108,24 @@ def parse_node_shard(shard_path: Path) -> dict[str, dict[str, Any]]:
                     continue
                 obj = json.loads(line)
                 if obj.get("_meta"):
+                    shard_machine_id = str(obj.get("machine_id") or "")
                     shard_machine_name = str(obj.get("machine_name") or "")
+                    shard_machine_type = str(obj.get("machine_type") or "")
+                    shard_machine_model = str(obj.get("machine_model") or "")
                     continue
                 uid = str(obj.get("uid") or "")
                 if not uid:
                     continue
                 if shard_machine_name:
                     obj["machine_name"] = shard_machine_name
+                if shard_machine_model and not obj.get("machine_model"):
+                    obj["machine_model"] = shard_machine_model
+                obj["machine_type"] = normalize_machine_type(
+                    shard_machine_type or str(obj.get("machine_type") or ""),
+                    machine_model=shard_machine_model or str(obj.get("machine_model") or ""),
+                    machine_name=str(obj.get("machine_name") or shard_machine_name),
+                    machine_id=str(obj.get("machine_id") or shard_machine_id),
+                )
                 records[uid] = obj
     except Exception as exc:
         logger.warning("Failed to parse node shard %s: %s", shard_path, exc)
@@ -165,6 +180,12 @@ def build_standalone_records(
             continue
         mid = str(item.get("machine_id") or "shared")
         mname = str(item.get("machine_name") or "跨设备共享")
+        mtype = normalize_machine_type(
+            str(item.get("machine_type") or ""),
+            machine_model=str(item.get("machine_model") or ""),
+            machine_name=mname,
+            machine_id=mid,
+        )
         tool = str(item.get("tool") or "web-link")
         tool_label = str(item.get("tool_label") or get_tool_label(tool, "外部会话链接"))
         pr_num = str(item.get("pr_number") or "").strip()
@@ -188,6 +209,7 @@ def build_standalone_records(
             "tool_label": tool_label,
             "machine_id": mid,
             "machine_name": mname,
+            "machine_type": mtype,
             "title": title,
             "first_prompt": note,
             "summary": str(item.get("external_url") or ""),
@@ -227,13 +249,23 @@ def prepare_row(
     branches_json = json.dumps(branches, ensure_ascii=False)
     prs_json = json.dumps(prs, ensure_ascii=False)
 
+    mid = str(rec.get("machine_id") or "")
+    mname = str(rec.get("machine_name") or "")
+    mtype = normalize_machine_type(
+        str(rec.get("machine_type") or ""),
+        machine_model=str(rec.get("machine_model") or ""),
+        machine_name=mname,
+        machine_id=mid,
+    )
+
     core_values = (
         str(rec["uid"]),
         str(rec.get("session_id") or ""),
         str(rec.get("tool") or ""),
         str(rec.get("tool_label") or ""),
-        str(rec.get("machine_id") or ""),
-        str(rec.get("machine_name") or ""),
+        mid,
+        mname,
+        mtype,
         str(rec.get("title") or ""),
         str(rec.get("first_prompt") or ""),
         str(rec.get("summary") or ""),
@@ -347,6 +379,8 @@ class ShardIngestor:
             "tool_label": tool_label,
             "machine_id": mid,
             "machine_name": machine_info["machine_name"],
+            "machine_type": str(machine_info.get("machine_type") or ""),
+            "machine_model": str(machine_info.get("machine_model") or ""),
             "created_at": int(time.time() * 1000),
         }
         link_file = self.paths.manual_links_dir / f"{mid}-links.jsonl"

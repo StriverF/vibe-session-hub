@@ -344,6 +344,22 @@ html.native-macos[data-theme="prism-aurora"] .topbar {
   min-width: 0;
 }
 
+.machine-chip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--text-secondary);
+}
+
+.machine-chip-icon:empty {
+  display: none;
+}
+
+.machine-chip:hover .machine-chip-icon {
+  color: var(--text);
+}
+
 #currentMachineName {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -852,6 +868,54 @@ span.update-pill-info {
   color: var(--text-secondary);
 }
 
+/* ===== Hardware Device Icons (Mac Studio / Mac mini / MacBook Pro / MacBook Air / iMac / Mac Pro) ===== */
+.device-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: currentColor;
+  line-height: 0;
+}
+
+.device-icon-img {
+  display: block;
+  height: 100%;
+  width: auto;
+  max-width: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 0.5px 1.2px rgba(0, 0, 0, 0.28));
+}
+
+.device-icon-fallback {
+  display: none;
+  height: 100%;
+  width: auto;
+}
+
+.device-icon.is-fallback .device-icon-img {
+  display: none;
+}
+
+.device-icon.is-fallback .device-icon-fallback {
+  display: block;
+}
+
+.device-icon-xs {
+  height: 13px;
+  max-width: 20px;
+}
+
+.device-icon-sm {
+  height: 16px;
+  max-width: 24px;
+}
+
+.device-icon-md {
+  height: 19px;
+  max-width: 28px;
+}
+
 .pr-toggle {
   margin-left: auto;
   display: inline-flex;
@@ -958,6 +1022,9 @@ span.update-pill-info {
 }
 
 .loc-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4.5px;
   font-size: 11px;
   font-weight: 500;
   padding: 2px 7.5px;
