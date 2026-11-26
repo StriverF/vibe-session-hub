@@ -305,6 +305,15 @@ jobs:
           assert d["version"] == os.environ["VERSION"], d
           print("DMG read-only runtime verified:", d["version"], d["server"]["base_url"])
           '
+          curl -fsS http://127.0.0.1:18488/api/update/changelog | VERSION="$VERSION" /usr/bin/python3 -c '
+          import json, os, sys
+          d = json.load(sys.stdin)
+          assert d["ok"] is True, d
+          assert d["entries"], d
+          assert d["entries"][0]["version"] == os.environ["VERSION"], d["entries"][:2]
+          assert d["entries"][0]["items"], d["entries"][0]
+          print("Bundled changelog verified:", d["entries"][0]["version"], len(d["entries"][0]["items"]), "items")
+          '
           (cd dist && /usr/bin/shasum -a 256 -c "${DMG_NAME}.sha256")
 
       - name: Generate GitHub Release notes

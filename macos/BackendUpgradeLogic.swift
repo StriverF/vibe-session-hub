@@ -375,12 +375,31 @@ struct ReleaseUpdateInfo: Equatable {
 struct UpdateRestartMarker: Codable, Equatable {
     let from: String
     let to: String
+    let notes: String?
+    let publishedAt: String?
+
+    init(from: String, to: String, notes: String? = nil, publishedAt: String? = nil) {
+        self.from = from
+        self.to = to
+        self.notes = notes
+        self.publishedAt = publishedAt
+    }
 }
 
 struct JustUpdatedOutcome: Equatable {
     let from: String
     let to: String
     let ok: Bool
+    let notes: String
+    let publishedAt: String
+
+    init(from: String, to: String, ok: Bool, notes: String = "", publishedAt: String = "") {
+        self.from = from
+        self.to = to
+        self.ok = ok
+        self.notes = notes
+        self.publishedAt = publishedAt
+    }
 }
 
 enum Sha256ReconcileResult: Equatable {

@@ -683,6 +683,64 @@ class TestP2PathValidationAndCustomPort(unittest.TestCase):
             self.assertNotIn("xattr -cr", notarized_notes)
             self.assertIn("Apple Developer ID", notarized_notes)
 
+            # Unreleased promotion & bundled CHANGELOG stamping when version heading is absent
+            unreleased_cl = Path(tmp) / "CHANGELOG_UNRELEASED.md"
+            unreleased_cl.write_text(
+                "# Changelog\n\n"
+                "## [Unreleased]\n\n"
+                "### Fixed\n- **Updater Notes**: Keep release notes across restart.\n\n"
+                "## [1.0.5] - 2026-11-25\n\n"
+                "### Fixed\n- Antigravity launch fix.\n",
+                encoding="utf-8",
+            )
+            body, source = mod.resolve_release_body(
+                version="1.0.6",
+                tag="v1.0.6",
+                changelog_path=unreleased_cl,
+                repo_root=Path(tmp),
+            )
+            self.assertEqual(source, "unreleased")
+            self.assertIn("Keep release notes across restart", body)
+
+            bundled_out = Path(tmp) / "BUNDLED_CHANGELOG.md"
+            rc = mod.main(
+                [
+                    "--version",
+                    "1.0.6",
+                    "--tag",
+                    "v1.0.6",
+                    "--changelog",
+                    str(unreleased_cl),
+                    "--repo-root",
+                    str(tmp),
+                    "--date",
+                    "2026-11-26",
+                    "--bundle-changelog",
+                    str(bundled_out),
+                ]
+            )
+            self.assertEqual(rc, 0)
+            stamped_text = bundled_out.read_text(encoding="utf-8")
+            self.assertIn("## [1.0.6] - 2026-11-26", stamped_text)
+            self.assertIn("Keep release notes across restart", stamped_text)
+            self.assertIn("## [1.0.5] - 2026-11-25", stamped_text)
+            from hub import updater as updater_mod
+
+            parsed_bundled = updater_mod.parse_changelog_text(stamped_text)
+            self.assertEqual([e["version"] for e in parsed_bundled], ["1.0.6", "1.0.5"])
+            self.assertIn("Updater Notes", parsed_bundled[0]["items"][0])
+
+        # Repo CHANGELOG.md must include current VERSION and backfilled v1.0.1..v1.0.5 entries
+        repo_root = Path(__file__).resolve().parent.parent
+        repo_ver = (repo_root / "VERSION").read_text(encoding="utf-8").strip().lstrip("vV")
+        repo_entries = updater_mod.parse_changelog_text(
+            (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
+        )
+        repo_versions = [e["version"] for e in repo_entries]
+        for expected_ver in ("1.0.5", "1.0.4", "1.0.3", "1.0.2", "1.0.1", "1.0.0"):
+            self.assertIn(expected_ver, repo_versions)
+        self.assertIn(repo_ver, repo_versions)
+
     def test_macos_entitlements_and_packaging_signing_hardening(self) -> None:
         import plistlib
 
@@ -704,6 +762,7 @@ class TestP2PathValidationAndCustomPort(unittest.TestCase):
         self.assertIn("open_antigravity_session", pkg_script)
         self.assertIn("AppUpdater.swift", pkg_script)
         self.assertIn("CHANGELOG.md", pkg_script)
+        self.assertIn("--bundle-changelog", pkg_script)
 
     def test_server_health_metadata_cache_headers_and_graceful_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -995,6 +1054,38 @@ expect(extractCliPortOverride(arguments: ["VibeSessionHub", "--port", "18421"]) 
 expect(extractCliPortOverride(arguments: ["VibeSessionHub", "--port=18422"]) == 18422, "cli --port= extracted")
 expect(extractCliPortOverride(arguments: ["VibeSessionHub"]) == nil, "no cli port returns nil")
 
+// 6b. UpdateRestartMarker Codable backward compatibility & notes persistence
+let legacyMarkerData = Data("{\"from\":\"1.0.4\",\"to\":\"1.0.5\"}".utf8)
+let decodedLegacy = try JSONDecoder().decode(UpdateRestartMarker.self, from: legacyMarkerData)
+expect(decodedLegacy.from == "1.0.4" && decodedLegacy.to == "1.0.5" && decodedLegacy.notes == nil, "legacy marker decodes")
+let richMarker = UpdateRestartMarker(from: "1.0.5", to: "1.0.6", notes: "- Persisted release notes", publishedAt: "2026-11-26T00:00:00Z")
+let encodedRich = try JSONEncoder().encode(richMarker)
+let decodedRich = try JSONDecoder().decode(UpdateRestartMarker.self, from: encodedRich)
+expect(decodedRich == richMarker, "rich marker round-trips with notes and publishedAt")
+
+// 6c. AppUpdater persists restart notes into update-last.json and survives dismissJustUpdated()
+let updaterStateDir = tmpDir.appendingPathComponent("updater-state")
+try fm.createDirectory(at: updaterStateDir, withIntermediateDirectories: true)
+try encodedRich.write(to: updaterStateDir.appendingPathComponent(AppUpdater.restartMarkerFilename))
+let updaterInst = AppUpdater(
+    currentVersion: "1.0.6",
+    stateDir: updaterStateDir,
+    bundleURL: tmpDir.appendingPathComponent("NonExistent.app"),
+    resourceURL: nil,
+    env: ["VIBE_HUB_DISABLE_AUTO_UPDATE_CHECK": "1"],
+    cliArguments: ["VibeSessionHub"]
+)
+let snapBeforeDismiss = updaterInst.snapshotDictionary()
+let justDict = snapBeforeDismiss["just_updated"] as? [String: Any]
+expect((justDict?["ok"] as? Bool) == true, "just_updated ok")
+expect((justDict?["notes"] as? String) == "- Persisted release notes", "just_updated exposes notes")
+expect((snapBeforeDismiss["updated_notes"] as? String) == "- Persisted release notes", "top-level updated_notes exposed")
+expect((snapBeforeDismiss["updated_published_at"] as? String) == "2026-11-26T00:00:00Z", "top-level updated_published_at exposed")
+updaterInst.dismissJustUpdated()
+let snapAfterDismiss = updaterInst.snapshotDictionary()
+expect(snapAfterDismiss["just_updated"] is NSNull, "just_updated dismissed")
+expect((snapAfterDismiss["updated_notes"] as? String) == "- Persisted release notes", "updated_notes survives dismiss")
+
 // 7. Execute real swap-on-exit script against a temporary app bundle directory
 let swapParent = tmpDir.appendingPathComponent("swap-test")
 let targetApp = swapParent.appendingPathComponent("Vibe Session Hub.app")
@@ -1030,8 +1121,18 @@ print("SWIFT_UPGRADE_LOGIC_OK")
             bin_path = tmp_path / "test_upgrade_logic"
             main_swift.write_text(driver, encoding="utf-8")
 
+            app_updater_file = repo_root / "macos" / "AppUpdater.swift"
             subprocess.run(
-                [swiftc, str(logic_file), str(main_swift), "-o", str(bin_path)],
+                [
+                    swiftc,
+                    "-framework",
+                    "AppKit",
+                    str(logic_file),
+                    str(app_updater_file),
+                    str(main_swift),
+                    "-o",
+                    str(bin_path),
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -1181,7 +1282,124 @@ print("SWIFT_UPGRADE_LOGIC_OK")
                 feed_srv.shutdown()
                 feed_srv.server_close()
 
-        # 3. Verify updateControl appears strictly BEFORE openThemeModalBtn in index.html
+        # 3. Verify remote GitHub Releases merge when local CHANGELOG is stale or remote=1 requested
+        self.assertEqual(
+            updater_mod.derive_releases_list_url(
+                "https://api.github.com/repos/StriverF/vibe-session-hub/releases/latest"
+            ),
+            "https://api.github.com/repos/StriverF/vibe-session-hub/releases?per_page=15",
+        )
+        self.assertEqual(
+            updater_mod.derive_releases_list_url("https://evil.example.com/releases/latest"),
+            "",
+        )
+
+        class MockReleasesListHandler(BaseHTTPRequestHandler):
+            calls = 0
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                MockReleasesListHandler.calls += 1
+                if self.path.startswith("/releases?"):
+                    payload = [
+                        {
+                            "tag_name": "v1.0.5",
+                            "draft": False,
+                            "prerelease": False,
+                            "published_at": "2026-11-25T14:25:01Z",
+                            "body": "## Vibe Session Hub v1.0.5\n\n### Fixed\n- Antigravity focus picker\n\n### 下载与安装\n1. Drag\n",
+                        },
+                        {
+                            "tag_name": "v1.0.4",
+                            "draft": False,
+                            "prerelease": False,
+                            "published_at": "2026-11-24T08:57:38Z",
+                            "body": "## Vibe Session Hub v1.0.4\n\n### Fixed\n- Bounded SQLite pool\n",
+                        },
+                        {
+                            "tag_name": "v1.0.6-rc.1",
+                            "draft": False,
+                            "prerelease": True,
+                            "published_at": "2026-11-26T00:00:00Z",
+                            "body": "- Prerelease should be skipped\n",
+                        },
+                        {
+                            "tag_name": "v1.0.0",
+                            "draft": False,
+                            "prerelease": False,
+                            "published_at": "2026-11-23T00:00:00Z",
+                            "body": "- Short remote summary\n",
+                        },
+                    ]
+                    raw = json.dumps(payload).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                self.send_error(404)
+
+        rel_srv = HTTPServer(("127.0.0.1", 0), MockReleasesListHandler)
+        rel_thread = threading.Thread(target=rel_srv.serve_forever, daemon=True)
+        rel_thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                # Simulate a stale bundled CHANGELOG.md that only has [Unreleased] and [1.0.0]
+                (root / "CHANGELOG.md").write_text(
+                    "# Changelog\n\n"
+                    "## [Unreleased]\n- Unversioned draft\n\n"
+                    "## [1.0.0] - 2026-11-23\n- Rich local v1.0.0 summary\n",
+                    encoding="utf-8",
+                )
+                paths = config_mod.HubPaths.from_state_dir(
+                    root / "state", icloud_root=root / "no-icloud"
+                )
+                store = storage_mod.SessionHubStore(local_only=True, paths=paths)
+                checker = updater_mod.UpdateChecker(
+                    current_version="1.0.5",
+                    backend_root=root,
+                    feed_url=f"http://127.0.0.1:{rel_srv.server_port}/releases/latest",
+                    allow_loopback=True,
+                )
+                srv = server_mod.create_http_server(
+                    store, host="127.0.0.1", port=0, updater=checker
+                )
+                srv_thread = threading.Thread(
+                    target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+                )
+                srv_thread.start()
+                port = srv.server_port
+                try:
+                    with urlopen(f"http://127.0.0.1:{port}/api/update/changelog", timeout=3) as resp:
+                        merged = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(merged["ok"])
+                    self.assertEqual(
+                        [e["version"] for e in merged["entries"]],
+                        ["1.0.5", "1.0.4", "1.0.0"],
+                    )
+                    self.assertIn("Antigravity focus picker", merged["entries"][0]["items"][0])
+                    # Rich local v1.0.0 description must be preserved over short remote text
+                    self.assertIn("Rich local v1.0.0 summary", merged["entries"][2]["items"][0])
+                    self.assertEqual(MockReleasesListHandler.calls, 1)
+
+                    # Subsequent ?remote=1 hits TTL cache rather than re-fetching
+                    with urlopen(f"http://127.0.0.1:{port}/api/update/changelog?remote=1", timeout=3) as resp:
+                        cached = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(len(cached["entries"]), 3)
+                    self.assertEqual(MockReleasesListHandler.calls, 1)
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
+                    store.close()
+        finally:
+            rel_srv.shutdown()
+            rel_srv.server_close()
+
+        # 4. Verify updateControl appears strictly BEFORE openThemeModalBtn in index.html
         html_text = (
             Path(__file__).resolve().parent.parent / "static" / "index.html"
         ).read_text(encoding="utf-8")
