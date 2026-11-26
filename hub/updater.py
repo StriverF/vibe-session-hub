@@ -7,10 +7,11 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from functools import cmp_to_key
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from . import __version__
@@ -167,9 +168,15 @@ def parse_changelog_text(text: str) -> list[dict[str, Any]]:
     """Parse released version entries from CHANGELOG.md (newest first)."""
     entries: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+    in_code_fence = False
 
     for raw_line in str(text or "").splitlines():
         line = raw_line.strip()
+        if line.startswith("```"):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
+            continue
         if line.startswith("## "):
             match = _CHANGELOG_HEADING_RE.match(line)
             if match:
@@ -184,11 +191,137 @@ def parse_changelog_text(text: str) -> list[dict[str, Any]]:
             continue
         if current is None:
             continue
-        if line.startswith("- "):
+        if line.startswith(("- ", "* ")):
             item = line[2:].strip()
             if item:
                 current["items"].append(item)
     return entries
+
+
+def parse_release_notes_items(notes: str) -> list[str]:
+    """Extract bullet items from cleaned GitHub Release markdown notes."""
+    bullets: list[str] = []
+    plain: list[str] = []
+    in_code_fence = False
+
+    for raw_line in str(notes or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("```"):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence or not line or line.startswith("#") or line.startswith(">"):
+            continue
+        if line.startswith(("- ", "* ", "• ")):
+            item = line[2:].strip()
+            if item:
+                bullets.append(item)
+        else:
+            plain.append(line)
+    return bullets if bullets else plain
+
+
+def parse_github_releases_changelog(payload: Any) -> list[dict[str, Any]]:
+    """Parse a GitHub Releases list API response into changelog entries."""
+    if not isinstance(payload, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        if item.get("draft") is True or item.get("prerelease") is True:
+            continue
+        tag = str(item.get("tag_name") or "").strip()
+        if not tag:
+            continue
+        version = tag[1:] if tag.startswith(("v", "V")) else tag
+        if not version or _parse_semver(version) is None:
+            continue
+        cleaned_notes = clean_release_notes(str(item.get("body") or ""))
+        note_items = parse_release_notes_items(cleaned_notes)
+        if not note_items:
+            continue
+        pub_raw = str(item.get("published_at") or "").strip()
+        date_str = pub_raw[:10] if re.match(r"^\d{4}-\d{2}-\d{2}", pub_raw) else ""
+        entries.append(
+            {
+                "version": version,
+                "date": date_str,
+                "items": note_items,
+            }
+        )
+    return entries
+
+
+def merge_changelog_entries(
+    local_entries: list[dict[str, Any]],
+    remote_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge local CHANGELOG.md entries with remote GitHub Releases, preferring richer local items."""
+    by_version: dict[str, dict[str, Any]] = {}
+
+    def _upsert(entry: dict[str, Any], *, is_local: bool) -> None:
+        raw_ver = str(entry.get("version") or "").strip()
+        ver = raw_ver[1:] if raw_ver.startswith(("v", "V")) else raw_ver
+        if not ver:
+            return
+        date_str = str(entry.get("date") or "").strip()
+        items = [str(x).strip() for x in (entry.get("items") or []) if str(x).strip()]
+        existing = by_version.get(ver)
+        if existing is None:
+            by_version[ver] = {
+                "version": ver,
+                "date": date_str,
+                "items": items,
+            }
+            return
+        if is_local:
+            if items:
+                existing["items"] = items
+            if date_str:
+                existing["date"] = date_str
+        else:
+            if not existing["items"] and items:
+                existing["items"] = items
+            if not existing["date"] and date_str:
+                existing["date"] = date_str
+
+    for e in local_entries:
+        _upsert(e, is_local=True)
+    for e in remote_entries:
+        _upsert(e, is_local=False)
+
+    merged = list(by_version.values())
+    merged.sort(
+        key=cmp_to_key(lambda a, b: compare_semver(b["version"], a["version"]))
+    )
+    return merged
+
+
+def derive_releases_list_url(
+    feed_url: str,
+    *,
+    allow_loopback: bool = False,
+    per_page: int = 15,
+) -> str:
+    """Derive a trusted `/releases?per_page=N` URL from a `/releases/latest` feed URL."""
+    raw = str(feed_url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        return ""
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/releases/latest"):
+        return ""
+    list_path = path[: -len("/latest")]
+    query = urlencode({"per_page": max(1, min(30, int(per_page)))})
+    candidate = urlunparse(
+        (parsed.scheme, parsed.netloc, list_path, "", query, "")
+    )
+    if not is_trusted_update_url(candidate, allow_loopback=allow_loopback):
+        return ""
+    return candidate
 
 
 def parse_sha256_digest(raw: str) -> str:
@@ -300,8 +433,10 @@ class UpdateChecker:
         current_version: str = __version__,
         backend_root: Path | None = None,
         feed_url: str | None = None,
+        releases_url: str | None = None,
         allow_loopback: bool | None = None,
         timeout_sec: float = DEFAULT_UPDATE_TIMEOUT_SEC,
+        remote_changelog_ttl_sec: float = 900.0,
     ) -> None:
         self.current_version = current_version.lstrip("vV").strip() or "1.0.0"
         self.backend_root = (
@@ -318,18 +453,108 @@ class UpdateChecker:
             self._allow_loopback = (
                 resolved_loopback if allow_loopback is None else bool(allow_loopback)
             )
+        if releases_url is not None:
+            self._releases_url = (
+                releases_url
+                if is_trusted_update_url(
+                    releases_url, allow_loopback=self._allow_loopback
+                )
+                else ""
+            )
+        else:
+            self._releases_url = derive_releases_list_url(
+                self._feed_url, allow_loopback=self._allow_loopback
+            )
         self.timeout_sec = timeout_sec
+        self._remote_changelog_ttl_sec = max(1.0, float(remote_changelog_ttl_sec))
         self._lock = threading.Lock()
         self._check_inflight_lock = threading.Lock()
+        self._changelog_fetch_lock = threading.Lock()
+        self._remote_changelog_entries: list[dict[str, Any]] | None = None
+        self._remote_changelog_fetched_at: float = 0.0
+        self._remote_changelog_error_at: float = 0.0
         self._state = _CheckerState()
 
-    def get_changelog(self) -> list[dict[str, Any]]:
+    def _fetch_remote_changelog(self) -> list[dict[str, Any]]:
+        if not self._releases_url:
+            return []
+        now = time.monotonic()
+        with self._lock:
+            if (
+                self._remote_changelog_entries is not None
+                and (now - self._remote_changelog_fetched_at) < self._remote_changelog_ttl_sec
+            ):
+                return [dict(e) for e in self._remote_changelog_entries]
+            if (
+                self._remote_changelog_error_at > 0
+                and (now - self._remote_changelog_error_at) < 120.0
+            ):
+                return [dict(e) for e in (self._remote_changelog_entries or [])]
+
+        with self._changelog_fetch_lock:
+            now = time.monotonic()
+            with self._lock:
+                if (
+                    self._remote_changelog_entries is not None
+                    and (now - self._remote_changelog_fetched_at) < self._remote_changelog_ttl_sec
+                ):
+                    return [dict(e) for e in self._remote_changelog_entries]
+                if (
+                    self._remote_changelog_error_at > 0
+                    and (now - self._remote_changelog_error_at) < 120.0
+                ):
+                    return [dict(e) for e in (self._remote_changelog_entries or [])]
+
+            try:
+                req = Request(
+                    self._releases_url,
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "User-Agent": f"VibeSessionHub/{self.current_version}",
+                    },
+                    method="GET",
+                )
+                with urlopen(req, timeout=min(self.timeout_sec, 6.0)) as resp:
+                    raw_body = resp.read(2 * 1024 * 1024)
+                payload = json.loads(raw_body.decode("utf-8"))
+                parsed = parse_github_releases_changelog(payload)
+                with self._lock:
+                    self._remote_changelog_entries = parsed
+                    self._remote_changelog_fetched_at = time.monotonic()
+                    self._remote_changelog_error_at = 0.0
+                return [dict(e) for e in parsed]
+            except Exception as exc:
+                logger.info("Remote changelog fetch failed: %s", exc)
+                with self._lock:
+                    self._remote_changelog_error_at = time.monotonic()
+                    return [dict(e) for e in (self._remote_changelog_entries or [])]
+
+    def get_changelog(self, *, include_remote: bool = False) -> list[dict[str, Any]]:
         changelog_file = self.backend_root / "CHANGELOG.md"
+        local_entries: list[dict[str, Any]] = []
         try:
             text = changelog_file.read_text(encoding="utf-8")
+            local_entries = parse_changelog_text(text)
         except OSError:
-            return []
-        return parse_changelog_text(text)
+            local_entries = []
+
+        has_current = any(
+            compare_semver(e["version"], self.current_version) == 0
+            for e in local_entries
+        )
+        auto_disabled = os.environ.get("VIBE_HUB_DISABLE_AUTO_UPDATE_CHECK") == "1"
+
+        remote_entries: list[dict[str, Any]] = []
+        if include_remote or (not has_current and not auto_disabled):
+            remote_entries = self._fetch_remote_changelog()
+        else:
+            with self._lock:
+                if self._remote_changelog_entries:
+                    remote_entries = [dict(e) for e in self._remote_changelog_entries]
+
+        if not remote_entries:
+            return local_entries
+        return merge_changelog_entries(local_entries, remote_entries)
 
     def get_status(self) -> dict[str, Any]:
         with self._lock:
@@ -352,6 +577,8 @@ class UpdateChecker:
                 "update": dict(st.update) if st.update is not None else None,
                 "just_updated": None,
                 "updated_from": "",
+                "updated_notes": "",
+                "updated_published_at": "",
             }
 
     def check_now(self) -> dict[str, Any]:

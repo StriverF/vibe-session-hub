@@ -462,11 +462,12 @@ class HubRequestHandler(BaseHTTPRequestHandler):
 
         if path == "/api/update/changelog":
             updater = self._get_updater()
+            include_remote = (qs.get("remote") or ["0"])[0] == "1"
             self._send_json(
                 {
                     "ok": True,
                     "current_version": updater.current_version,
-                    "entries": updater.get_changelog(),
+                    "entries": updater.get_changelog(include_remote=include_remote),
                 }
             )
             return

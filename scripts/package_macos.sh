@@ -224,7 +224,14 @@ cp "$ICNS_PATH" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
   "$PROJECT_DIR/static/" "$APP_BUNDLE/Contents/Resources/app/static/"
 
 printf '%s\n' "$VERSION" > "$APP_BUNDLE/Contents/Resources/app/VERSION"
-if [ -f "$PROJECT_DIR/CHANGELOG.md" ]; then
+if [ -f "$PROJECT_DIR/scripts/extract_release_notes.py" ] && [ -f "$PROJECT_DIR/CHANGELOG.md" ]; then
+  /usr/bin/python3 "$PROJECT_DIR/scripts/extract_release_notes.py" \
+    --version "$VERSION" \
+    --tag "v${VERSION}" \
+    --changelog "$PROJECT_DIR/CHANGELOG.md" \
+    --repo-root "$PROJECT_DIR" \
+    --bundle-changelog "$APP_BUNDLE/Contents/Resources/app/CHANGELOG.md"
+elif [ -f "$PROJECT_DIR/CHANGELOG.md" ]; then
   cp "$PROJECT_DIR/CHANGELOG.md" "$APP_BUNDLE/Contents/Resources/app/CHANGELOG.md"
 fi
 GIT_SHORT_SHA="$(git -C "$PROJECT_DIR" rev-parse --short=7 HEAD 2>/dev/null || echo "nogit")"

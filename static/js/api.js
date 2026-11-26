@@ -129,8 +129,9 @@ export function triggerUpdateCheck() {
   return postApi("/api/update/check", {});
 }
 
-export async function fetchChangelog() {
-  const res = await fetch("/api/update/changelog", { cache: "no-store" });
+export async function fetchChangelog({ remote = false } = {}) {
+  const url = remote ? "/api/update/changelog?remote=1" : "/api/update/changelog";
+  const res = await fetch(url, { cache: "no-store" });
   return res.json();
 }
 

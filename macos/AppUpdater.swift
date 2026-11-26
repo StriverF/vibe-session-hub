@@ -363,6 +363,8 @@ final class AppUpdater {
     private var foundUpdate: ReleaseUpdateInfo?
     private var justUpdated: JustUpdatedOutcome?
     private var updatedFrom: String = ""
+    private var updatedNotes: String = ""
+    private var updatedPublishedAt: String = ""
 
     private var activeDownloader: StreamingDmgDownloader?
     private var activeSidecarTask: URLSessionDataTask?
@@ -476,7 +478,13 @@ final class AppUpdater {
             if let marker = try? JSONDecoder().decode(UpdateRestartMarker.self, from: data),
                !marker.to.isEmpty {
                 let ok = compareSemver(currentVersion, marker.to) >= 0
-                loadedJust = JustUpdatedOutcome(from: marker.from, to: marker.to, ok: ok)
+                loadedJust = JustUpdatedOutcome(
+                    from: marker.from,
+                    to: marker.to,
+                    ok: ok,
+                    notes: marker.notes ?? "",
+                    publishedAt: marker.publishedAt ?? ""
+                )
                 NSLog("VibeSessionHub updater: requested v%@, running v%@ (ok=%@)", marker.to, currentVersion, ok ? "true" : "false")
                 if ok, let encoded = try? JSONEncoder().encode(marker) {
                     try? fm.createDirectory(at: stateDir, withIntermediateDirectories: true)
@@ -486,22 +494,33 @@ final class AppUpdater {
         }
 
         var loadedFrom = ""
+        var loadedNotes = ""
+        var loadedPublishedAt = ""
         if let data = try? Data(contentsOf: lastURL),
            let marker = try? JSONDecoder().decode(UpdateRestartMarker.self, from: data),
            compareSemver(currentVersion, marker.to) == 0 {
             loadedFrom = marker.from
+            loadedNotes = marker.notes ?? ""
+            loadedPublishedAt = marker.publishedAt ?? ""
         }
 
         stateLock.lock()
         justUpdated = loadedJust
         updatedFrom = loadedFrom
+        updatedNotes = loadedNotes
+        updatedPublishedAt = loadedPublishedAt
         stateLock.unlock()
     }
 
-    private func writeUpdateMarker(from: String, to: String) {
+    private func writeUpdateMarker(from: String, to: String, notes: String = "", publishedAt: String = "") {
         let fm = FileManager.default
         try? fm.createDirectory(at: stateDir, withIntermediateDirectories: true)
-        let marker = UpdateRestartMarker(from: from, to: to)
+        let marker = UpdateRestartMarker(
+            from: from,
+            to: to,
+            notes: notes.isEmpty ? nil : notes,
+            publishedAt: publishedAt.isEmpty ? nil : publishedAt
+        )
         guard let data = try? JSONEncoder().encode(marker) else { return }
         let markerURL = stateDir.appendingPathComponent(AppUpdater.restartMarkerFilename)
         try? data.write(to: markerURL, options: .atomic)
@@ -527,6 +546,8 @@ final class AppUpdater {
             "check_error": checkErrorText,
             "checked_at": checkedAtMs,
             "updated_from": updatedFrom,
+            "updated_notes": updatedNotes,
+            "updated_published_at": updatedPublishedAt,
         ]
 
         if let up = foundUpdate {
@@ -551,6 +572,8 @@ final class AppUpdater {
                 "from": just.from,
                 "to": just.to,
                 "ok": just.ok,
+                "notes": just.notes,
+                "published_at": just.publishedAt,
             ]
         } else {
             payload["just_updated"] = NSNull()
@@ -1025,7 +1048,12 @@ final class AppUpdater {
                 try? fm.removeItem(at: prev.workDir)
             }
 
-            writeUpdateMarker(from: currentVersion, to: release.version)
+            writeUpdateMarker(
+                from: currentVersion,
+                to: release.version,
+                notes: release.notes,
+                publishedAt: release.publishedAt
+            )
 
             stateLock.lock()
             status = "ready"

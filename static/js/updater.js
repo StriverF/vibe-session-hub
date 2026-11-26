@@ -9,6 +9,9 @@ const RESTART_HINT = "重启 Vibe Session Hub 以完成更新；不重启的话�
 
 let pendingManualCheckToast = false;
 let autoBrowserCheckTimer = null;
+let userExpandedAllNotes = false;
+let remoteChangelogInFlight = false;
+let remoteChangelogFetchedKey = "";
 
 export function isNativeUpdaterAvailable() {
   return Boolean(
@@ -46,6 +49,8 @@ function defaultUpdateState() {
     update: null,
     just_updated: null,
     updated_from: "",
+    updated_notes: "",
+    updated_published_at: "",
   };
 }
 
@@ -53,8 +58,62 @@ function getUpdateInfo() {
   return state.updateInfo || defaultUpdateState();
 }
 
+function normalizeVersion(ver) {
+  return String(ver || "").trim().replace(/^v/i, "");
+}
+
+function parseSemver(raw) {
+  let text = normalizeVersion(raw);
+  const plusIdx = text.indexOf("+");
+  if (plusIdx >= 0) text = text.slice(0, plusIdx);
+  if (!text) return null;
+  const dashIdx = text.indexOf("-");
+  const corePart = dashIdx >= 0 ? text.slice(0, dashIdx) : text;
+  const prePart = dashIdx >= 0 ? text.slice(dashIdx + 1) : "";
+  const rawNums = corePart.split(".");
+  if (!rawNums.length || rawNums.some((p) => !/^\d+$/.test(p))) return null;
+  return {
+    nums: rawNums.map((p) => Number.parseInt(p, 10)),
+    pre: prePart ? prePart.split(".").filter(Boolean) : [],
+  };
+}
+
+function compareSemver(lhs, rhs) {
+  const a = parseSemver(lhs);
+  const b = parseSemver(rhs);
+  if (!a || !b) {
+    const al = normalizeVersion(lhs);
+    const bl = normalizeVersion(rhs);
+    if (al === bl) return 0;
+    return al < bl ? -1 : 1;
+  }
+  const maxLen = Math.max(a.nums.length, b.nums.length);
+  for (let i = 0; i < maxLen; i += 1) {
+    const av = i < a.nums.length ? a.nums[i] : 0;
+    const bv = i < b.nums.length ? b.nums[i] : 0;
+    if (av !== bv) return av < bv ? -1 : 1;
+  }
+  if (!a.pre.length && !b.pre.length) return 0;
+  if (!a.pre.length) return 1;
+  if (!b.pre.length) return -1;
+  const minPre = Math.min(a.pre.length, b.pre.length);
+  for (let i = 0; i < minPre; i += 1) {
+    const ap = a.pre[i];
+    const bp = b.pre[i];
+    if (ap === bp) continue;
+    const aNum = /^\d+$/.test(ap);
+    const bNum = /^\d+$/.test(bp);
+    if (aNum && bNum) return Number.parseInt(ap, 10) < Number.parseInt(bp, 10) ? -1 : 1;
+    if (aNum) return -1;
+    if (bNum) return 1;
+    return ap < bp ? -1 : 1;
+  }
+  if (a.pre.length === b.pre.length) return 0;
+  return a.pre.length < b.pre.length ? -1 : 1;
+}
+
 function formatVersionTag(ver) {
-  const clean = String(ver || "").trim().replace(/^v/i, "");
+  const clean = normalizeVersion(ver);
   return clean ? `v${clean}` : "";
 }
 
@@ -84,16 +143,26 @@ function formatInlineMarkdown(raw) {
 }
 
 function parseNotesItems(notes) {
-  const items = [];
+  const bullets = [];
+  const plain = [];
+  let inCodeFence = false;
   for (const rawLine of String(notes || "").split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || line.startsWith("#") || line.startsWith(">") || line.startsWith("```")) {
+    if (line.startsWith("```")) {
+      inCodeFence = !inCodeFence;
       continue;
     }
-    const cleaned = line.replace(/^[-*•]\s+/, "").trim();
-    if (cleaned) items.push(cleaned);
+    if (inCodeFence || !line || line.startsWith("#") || line.startsWith(">")) {
+      continue;
+    }
+    if (/^[-*•]\s+/.test(line)) {
+      const cleaned = line.replace(/^[-*•]\s+/, "").trim();
+      if (cleaned) bullets.push(cleaned);
+    } else {
+      plain.push(line);
+    }
   }
-  return items;
+  return bullets.length ? bullets : plain;
 }
 
 function describeCannotSelfUpdate(reason) {
@@ -118,29 +187,92 @@ function safeOpenExternalUrl(rawUrl) {
 }
 
 function buildCombinedChangelogEntries(info) {
-  const entries = (state.changelogEntries || []).map((e) => ({
-    version: String(e.version || "").replace(/^v/i, ""),
-    date: e.date || "",
-    items: Array.isArray(e.items) ? e.items : [],
-    next: false,
-  }));
+  const entries = (state.changelogEntries || [])
+    .map((e) => ({
+      version: normalizeVersion(e.version),
+      date: e.date || "",
+      items: Array.isArray(e.items) ? [...e.items] : [],
+      next: false,
+    }))
+    .filter((e) => e.version);
 
-  const up = info.update;
-  if (up && up.version && up.notes) {
-    const nextVer = String(up.version).replace(/^v/i, "");
-    if (!entries.some((e) => e.version === nextVer)) {
-      const nextItems = parseNotesItems(up.notes);
-      if (nextItems.length) {
-        entries.unshift({
-          version: nextVer,
-          date: formatReleaseDate(up.published_at),
-          items: nextItems,
-          next: true,
-        });
-      }
+  const upsertEntry = (version, date, notes, { markNext = false } = {}) => {
+    const cleanVer = normalizeVersion(version);
+    if (!cleanVer) return;
+    const parsedItems = notes ? parseNotesItems(notes) : [];
+    const formattedDate = formatReleaseDate(date);
+    const existing = entries.find((e) => compareSemver(e.version, cleanVer) === 0);
+    if (existing) {
+      if (markNext) existing.next = true;
+      if (!existing.items.length && parsedItems.length) existing.items = parsedItems;
+      if (!existing.date && formattedDate) existing.date = formattedDate;
+      return;
     }
+    if (parsedItems.length) {
+      entries.push({
+        version: cleanVer,
+        date: formattedDate,
+        items: parsedItems,
+        next: markNext,
+      });
+    }
+  };
+
+  // Merge persisted post-restart release notes from AppUpdater (survives dismissJustUpdated)
+  const upgradedVer = normalizeVersion(
+    info.just_updated?.to || (info.updated_notes ? info.current_version || state.serverVersion : "")
+  );
+  const upgradedNotes = info.just_updated?.notes || info.updated_notes || "";
+  const upgradedDate = info.just_updated?.published_at || info.updated_published_at || "";
+  if (upgradedVer && upgradedNotes) {
+    upsertEntry(upgradedVer, upgradedDate, upgradedNotes, { markNext: false });
   }
+
+  // Merge newly discovered available/downloading/ready release notes
+  const up = info.update;
+  if (up && up.version) {
+    upsertEntry(up.version, up.published_at, up.notes, { markNext: true });
+  }
+
+  entries.sort((a, b) => compareSemver(b.version, a.version));
   return entries;
+}
+
+function loadChangelogEntries({ remote = false } = {}) {
+  if (remote) {
+    if (remoteChangelogInFlight) return;
+    remoteChangelogInFlight = true;
+  }
+  fetchChangelog({ remote })
+    .then((res) => {
+      if (res && Array.isArray(res.entries)) {
+        state.changelogEntries = res.entries;
+        renderUpdateModal();
+      }
+    })
+    .catch(() => {})
+    .finally(() => {
+      if (remote) {
+        remoteChangelogInFlight = false;
+      }
+    });
+}
+
+function maybeRefreshRemoteChangelog(info) {
+  const currentVer = normalizeVersion(info.current_version || state.serverVersion);
+  const nextVer = normalizeVersion(info.update?.version);
+  const entries = state.changelogEntries || [];
+  const hasCurrent =
+    !currentVer || entries.some((e) => compareSemver(e.version, currentVer) === 0);
+  const hasNext =
+    !nextVer || entries.some((e) => compareSemver(e.version, nextVer) === 0);
+  const needsRemote = !entries.length || !hasCurrent || !hasNext || Boolean(nextVer);
+  if (!needsRemote) return;
+
+  const key = `${currentVer}|${nextVer}`;
+  if (remoteChangelogFetchedKey === key || remoteChangelogInFlight) return;
+  remoteChangelogFetchedKey = key;
+  loadChangelogEntries({ remote: true });
 }
 
 export function renderUpdateControl() {
@@ -498,13 +630,25 @@ function renderChangelogList(info, currentVer) {
   const all = buildCombinedChangelogEntries(info);
   let list = all;
 
-  if (state.updateModalScope === "next" && all.length && all[0].next) {
-    list = all.slice(0, 1);
+  if (state.updateModalScope === "next") {
+    const newerEntries = currentVer
+      ? all.filter((e) => compareSemver(e.version, currentVer) > 0)
+      : all.filter((e) => e.next);
+    if (newerEntries.length) {
+      list = newerEntries;
+    } else if (all.length && all[0].next) {
+      list = all.slice(0, 1);
+    }
   } else if (state.updateModalScope === "since" && info.updated_from) {
-    const fromClean = String(info.updated_from).replace(/^v/i, "");
-    const idx = all.findIndex((e) => e.version === fromClean);
+    const fromClean = normalizeVersion(info.updated_from);
+    const idx = all.findIndex((e) => compareSemver(e.version, fromClean) === 0);
     if (idx >= 0) {
       list = all.slice(0, idx + 1);
+    } else {
+      const newerThanFrom = all.filter((e) => compareSemver(e.version, fromClean) > 0);
+      if (newerThanFrom.length) {
+        list = newerThanFrom;
+      }
     }
   }
 
@@ -517,7 +661,7 @@ function renderChangelogList(info, currentVer) {
     return;
   }
 
-  const fromClean = String(info.updated_from || "").replace(/^v/i, "");
+  const fromClean = normalizeVersion(info.updated_from);
   els.updateChangelogList.innerHTML = list
     .map((entry) => {
       const tags = [];
@@ -525,10 +669,10 @@ function renderChangelogList(info, currentVer) {
         const nextLabel = info.status === "ready" ? "已装好，待重启" : "新版本";
         tags.push(`<span class="update-changelog-tag is-accent">${escapeHtml(nextLabel)}</span>`);
       }
-      if (currentVer && entry.version === currentVer) {
+      if (currentVer && compareSemver(entry.version, currentVer) === 0) {
         tags.push(`<span class="update-changelog-tag is-current">当前版本</span>`);
       }
-      if (fromClean && entry.version === fromClean) {
+      if (fromClean && compareSemver(entry.version, fromClean) === 0) {
         tags.push(`<span class="update-changelog-tag">升级前版本</span>`);
       }
 
@@ -557,10 +701,21 @@ function renderChangelogList(info, currentVer) {
 export function applyUpdateSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return;
   const prev = state.updateInfo;
+  const prevUpdateVer = normalizeVersion(prev?.update?.version);
   state.updateInfo = { ...defaultUpdateState(), ...snapshot };
+  const nextUpdateVer = normalizeVersion(state.updateInfo.update?.version);
+  const newlyDiscovered = Boolean(nextUpdateVer && nextUpdateVer !== prevUpdateVer);
+
+  if (newlyDiscovered && !userExpandedAllNotes && state.updateModalScope !== "since") {
+    state.updateModalScope = "next";
+  }
 
   renderUpdateControl();
   renderUpdateModal();
+
+  if (newlyDiscovered || state.updateInfo.just_updated?.ok) {
+    maybeRefreshRemoteChangelog(state.updateInfo);
+  }
 
   if (pendingManualCheckToast && !state.updateInfo.checking) {
     pendingManualCheckToast = false;
@@ -669,15 +824,17 @@ export function openDownloadURL() {
 export function openUpdateModal(scope = "default") {
   if (!els.updateModal) return;
   const info = getUpdateInfo();
+  userExpandedAllNotes = false;
   if (scope === "next") {
     state.updateModalScope = "next";
   } else if (scope === "since") {
     state.updateModalScope = "since";
   } else {
-    state.updateModalScope = info.update && info.update.notes ? "next" : "all";
+    state.updateModalScope = info.update && info.update.version ? "next" : "all";
   }
   els.updateModal.classList.remove("hidden");
   renderUpdateModal();
+  maybeRefreshRemoteChangelog(info);
 
   if (!info.checked_at && !info.checking && !info.update) {
     checkForUpdates(false);
@@ -762,6 +919,7 @@ export function bindUpdaterEvents() {
   }
   if (els.updateToggleAllNotesBtn) {
     els.updateToggleAllNotesBtn.addEventListener("click", () => {
+      userExpandedAllNotes = true;
       state.updateModalScope = "all";
       renderUpdateModal();
     });
@@ -784,14 +942,7 @@ export async function initUpdater() {
   renderUpdateControl();
 
   // Load bundled local CHANGELOG.md in background
-  fetchChangelog()
-    .then((res) => {
-      if (res && Array.isArray(res.entries)) {
-        state.changelogEntries = res.entries;
-        renderUpdateModal();
-      }
-    })
-    .catch(() => {});
+  loadChangelogEntries({ remote: false });
 
   if (isNativeUpdaterAvailable()) {
     postNativeAction("getState");
