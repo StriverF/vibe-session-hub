@@ -255,9 +255,9 @@ def resolve_release_body(
 
     commits = collect_git_commit_highlights(tag, root)
     if commits:
-        return "### What's Changed\n\n" + commits, "git"
+        return "### 本次更新\n\n" + commits, "git"
 
-    return f"- Release `{tag}` of Vibe Session Hub.", "fallback"
+    return f"- 发布 Vibe Session Hub `{tag}` 版本。", "fallback"
 
 
 def stamp_changelog_for_release(
@@ -278,7 +278,7 @@ def stamp_changelog_for_release(
 
     clean_body = str(body or "").strip()
     if not clean_body:
-        clean_body = f"- Release `v{clean_ver}` of Vibe Session Hub."
+        clean_body = f"- 发布 Vibe Session Hub `v{clean_ver}` 版本。"
 
     stamped_block = f"## [{clean_ver}] - {release_date}\n\n{clean_body}\n"
     matches = list(SECTION_RE.finditer(changelog_text))
@@ -313,7 +313,7 @@ def stamp_changelog_for_release(
     base = changelog_text.rstrip()
     if base:
         return f"{base}\n\n{stamped_block}"
-    return f"# Changelog\n\n{stamped_block}"
+    return f"# 更新日志\n\n{stamped_block}"
 
 
 def build_release_notes(

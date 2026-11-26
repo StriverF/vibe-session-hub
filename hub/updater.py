@@ -164,10 +164,67 @@ def clean_release_notes(raw_notes: str) -> str:
     return text
 
 
+_SECTION_TITLE_MAP = {
+    "added": "新增",
+    "new": "新增",
+    "feature": "新增",
+    "features": "新增",
+    "新增": "新增",
+    "新功能": "新增",
+    "changed": "优化",
+    "improved": "优化",
+    "improvements": "优化",
+    "optimized": "优化",
+    "optimization": "优化",
+    "优化": "优化",
+    "变更": "优化",
+    "改进": "优化",
+    "fixed": "修复",
+    "fix": "修复",
+    "fixes": "修复",
+    "bug fix": "修复",
+    "bug fixes": "修复",
+    "bugfixes": "修复",
+    "修复": "修复",
+    "问题修复": "修复",
+    "security": "安全",
+    "安全": "安全",
+    "removed": "移除",
+    "deprecated": "移除",
+    "移除": "移除",
+    "废弃": "移除",
+    "what's changed": "更新内容",
+    "whats changed": "更新内容",
+    "本次更新": "更新内容",
+    "更新内容": "更新内容",
+}
+
+
+def normalize_changelog_section_title(raw_title: str) -> str:
+    """Normalize English/Chinese changelog subheadings to concise Chinese labels."""
+    text = str(raw_title or "").strip().strip("*`")
+    if not text:
+        return ""
+    return _SECTION_TITLE_MAP.get(text.lower(), text)
+
+
+def _append_section_item(
+    sections: list[dict[str, Any]],
+    title: str,
+    item: str,
+) -> None:
+    if sections and sections[-1]["title"] == title:
+        sections[-1]["items"].append(item)
+    else:
+        sections.append({"title": title, "items": [item]})
+
+
 def parse_changelog_text(text: str) -> list[dict[str, Any]]:
     """Parse released version entries from CHANGELOG.md (newest first)."""
     entries: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+    current_section = ""
+    skip_until_next_version = False
     in_code_fence = False
 
     for raw_line in str(text or "").splitlines():
@@ -178,30 +235,41 @@ def parse_changelog_text(text: str) -> list[dict[str, Any]]:
         if in_code_fence:
             continue
         if line.startswith("## "):
+            skip_until_next_version = False
+            current_section = ""
             match = _CHANGELOG_HEADING_RE.match(line)
             if match:
                 current = {
                     "version": match.group(1),
                     "date": match.group(2) or "",
                     "items": [],
+                    "sections": [],
                 }
                 entries.append(current)
             else:
                 current = None
             continue
-        if current is None:
+        if current is None or skip_until_next_version:
+            continue
+        if line.startswith("### "):
+            if _INSTALL_SECTION_RE.match(line):
+                skip_until_next_version = True
+                continue
+            current_section = normalize_changelog_section_title(line[4:])
             continue
         if line.startswith(("- ", "* ")):
             item = line[2:].strip()
             if item:
                 current["items"].append(item)
+                _append_section_item(current["sections"], current_section, item)
     return entries
 
 
-def parse_release_notes_items(notes: str) -> list[str]:
-    """Extract bullet items from cleaned GitHub Release markdown notes."""
-    bullets: list[str] = []
-    plain: list[str] = []
+def parse_release_notes_sections(notes: str) -> list[dict[str, Any]]:
+    """Extract categorized bullet sections from cleaned GitHub Release markdown notes."""
+    bullet_sections: list[dict[str, Any]] = []
+    plain_sections: list[dict[str, Any]] = []
+    current_section = ""
     in_code_fence = False
 
     for raw_line in str(notes or "").splitlines():
@@ -209,15 +277,30 @@ def parse_release_notes_items(notes: str) -> list[str]:
         if line.startswith("```"):
             in_code_fence = not in_code_fence
             continue
-        if in_code_fence or not line or line.startswith("#") or line.startswith(">"):
+        if in_code_fence or not line or line.startswith(">"):
+            continue
+        if line.startswith("### "):
+            if _INSTALL_SECTION_RE.match(line):
+                break
+            current_section = normalize_changelog_section_title(line[4:])
+            continue
+        if line.startswith("#"):
             continue
         if line.startswith(("- ", "* ", "• ")):
             item = line[2:].strip()
             if item:
-                bullets.append(item)
+                _append_section_item(bullet_sections, current_section, item)
         else:
-            plain.append(line)
-    return bullets if bullets else plain
+            _append_section_item(plain_sections, current_section, line)
+    return bullet_sections if bullet_sections else plain_sections
+
+
+def parse_release_notes_items(notes: str) -> list[str]:
+    """Extract flat bullet items from cleaned GitHub Release markdown notes."""
+    items: list[str] = []
+    for sec in parse_release_notes_sections(notes):
+        items.extend(sec["items"])
+    return items
 
 
 def parse_github_releases_changelog(payload: Any) -> list[dict[str, Any]]:
@@ -237,7 +320,8 @@ def parse_github_releases_changelog(payload: Any) -> list[dict[str, Any]]:
         if not version or _parse_semver(version) is None:
             continue
         cleaned_notes = clean_release_notes(str(item.get("body") or ""))
-        note_items = parse_release_notes_items(cleaned_notes)
+        note_sections = parse_release_notes_sections(cleaned_notes)
+        note_items = [it for sec in note_sections for it in sec["items"]]
         if not note_items:
             continue
         pub_raw = str(item.get("published_at") or "").strip()
@@ -247,9 +331,28 @@ def parse_github_releases_changelog(payload: Any) -> list[dict[str, Any]]:
                 "version": version,
                 "date": date_str,
                 "items": note_items,
+                "sections": note_sections,
             }
         )
     return entries
+
+
+def _normalize_sections_field(
+    raw_sections: Any,
+    fallback_items: list[str],
+) -> list[dict[str, Any]]:
+    sections: list[dict[str, Any]] = []
+    if isinstance(raw_sections, list):
+        for sec in raw_sections:
+            if not isinstance(sec, dict):
+                continue
+            title = normalize_changelog_section_title(str(sec.get("title") or ""))
+            sec_items = [str(x).strip() for x in (sec.get("items") or []) if str(x).strip()]
+            for it in sec_items:
+                _append_section_item(sections, title, it)
+    if not sections and fallback_items:
+        sections.append({"title": "", "items": list(fallback_items)})
+    return sections
 
 
 def merge_changelog_entries(
@@ -266,22 +369,28 @@ def merge_changelog_entries(
             return
         date_str = str(entry.get("date") or "").strip()
         items = [str(x).strip() for x in (entry.get("items") or []) if str(x).strip()]
+        sections = _normalize_sections_field(entry.get("sections"), items)
+        if not items and sections:
+            items = [it for sec in sections for it in sec["items"]]
         existing = by_version.get(ver)
         if existing is None:
             by_version[ver] = {
                 "version": ver,
                 "date": date_str,
                 "items": items,
+                "sections": sections,
             }
             return
         if is_local:
             if items:
                 existing["items"] = items
+                existing["sections"] = sections
             if date_str:
                 existing["date"] = date_str
         else:
             if not existing["items"] and items:
                 existing["items"] = items
+                existing["sections"] = sections
             if not existing["date"] and date_str:
                 existing["date"] = date_str
 
