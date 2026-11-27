@@ -729,17 +729,25 @@ class TestP2PathValidationAndCustomPort(unittest.TestCase):
             parsed_bundled = updater_mod.parse_changelog_text(stamped_text)
             self.assertEqual([e["version"] for e in parsed_bundled], ["1.0.6", "1.0.5"])
             self.assertIn("Updater Notes", parsed_bundled[0]["items"][0])
+            self.assertEqual(parsed_bundled[0]["sections"][0]["title"], "修复")
 
-        # Repo CHANGELOG.md must include current VERSION and backfilled v1.0.1..v1.0.5 entries
+        # Repo CHANGELOG.md must include current VERSION and categorized v1.0.0..v1.0.6 entries
         repo_root = Path(__file__).resolve().parent.parent
         repo_ver = (repo_root / "VERSION").read_text(encoding="utf-8").strip().lstrip("vV")
         repo_entries = updater_mod.parse_changelog_text(
             (repo_root / "CHANGELOG.md").read_text(encoding="utf-8")
         )
         repo_versions = [e["version"] for e in repo_entries]
-        for expected_ver in ("1.0.5", "1.0.4", "1.0.3", "1.0.2", "1.0.1", "1.0.0"):
+        for expected_ver in ("1.0.6", "1.0.5", "1.0.4", "1.0.3", "1.0.2", "1.0.1", "1.0.0"):
             self.assertIn(expected_ver, repo_versions)
         self.assertIn(repo_ver, repo_versions)
+        valid_titles = {"新增", "优化", "修复", "安全", "移除", "更新内容"}
+        for entry in repo_entries:
+            self.assertTrue(entry["items"], f"empty items for {entry['version']}")
+            self.assertTrue(entry["sections"], f"empty sections for {entry['version']}")
+            for sec in entry["sections"]:
+                self.assertIn(sec["title"], valid_titles)
+                self.assertTrue(sec["items"])
 
     def test_macos_entitlements_and_packaging_signing_hardening(self) -> None:
         import plistlib
@@ -1382,6 +1390,7 @@ print("SWIFT_UPGRADE_LOGIC_OK")
                         ["1.0.5", "1.0.4", "1.0.0"],
                     )
                     self.assertIn("Antigravity focus picker", merged["entries"][0]["items"][0])
+                    self.assertEqual(merged["entries"][0]["sections"][0]["title"], "修复")
                     # Rich local v1.0.0 description must be preserved over short remote text
                     self.assertIn("Rich local v1.0.0 summary", merged["entries"][2]["items"][0])
                     self.assertEqual(MockReleasesListHandler.calls, 1)

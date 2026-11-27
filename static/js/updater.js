@@ -142,9 +142,98 @@ function formatInlineMarkdown(raw) {
   return safe;
 }
 
-function parseNotesItems(notes) {
-  const bullets = [];
-  const plain = [];
+const SECTION_TITLE_MAP = {
+  added: "新增",
+  new: "新增",
+  feature: "新增",
+  features: "新增",
+  新增: "新增",
+  新功能: "新增",
+  changed: "优化",
+  improved: "优化",
+  improvements: "优化",
+  optimized: "优化",
+  optimization: "优化",
+  优化: "优化",
+  变更: "优化",
+  改进: "优化",
+  fixed: "修复",
+  fix: "修复",
+  fixes: "修复",
+  "bug fix": "修复",
+  "bug fixes": "修复",
+  bugfixes: "修复",
+  修复: "修复",
+  问题修复: "修复",
+  security: "安全",
+  安全: "安全",
+  removed: "移除",
+  deprecated: "移除",
+  移除: "移除",
+  废弃: "移除",
+  "what's changed": "更新内容",
+  "whats changed": "更新内容",
+  本次更新: "更新内容",
+  更新内容: "更新内容",
+};
+
+const INSTALL_SECTION_RE = /^###\s+(?:下载与安装|校验和|Download|Install|Checksum)/i;
+
+function normalizeSectionTitle(rawTitle) {
+  const cleaned = String(rawTitle || "").trim().replace(/^[*`]+|[*`]+$/g, "");
+  if (!cleaned) return "";
+  return SECTION_TITLE_MAP[cleaned.toLowerCase()] || cleaned;
+}
+
+function sectionKindClass(title) {
+  switch (title) {
+    case "新增":
+      return "is-added";
+    case "优化":
+      return "is-changed";
+    case "修复":
+      return "is-fixed";
+    case "安全":
+      return "is-security";
+    case "移除":
+      return "is-removed";
+    default:
+      return "";
+  }
+}
+
+function appendSectionItem(sections, title, item) {
+  if (sections.length && sections[sections.length - 1].title === title) {
+    sections[sections.length - 1].items.push(item);
+  } else {
+    sections.push({ title, items: [item] });
+  }
+}
+
+function normalizeEntrySections(rawSections, fallbackItems = []) {
+  const sections = [];
+  if (Array.isArray(rawSections)) {
+    for (const sec of rawSections) {
+      if (!sec || typeof sec !== "object") continue;
+      const title = normalizeSectionTitle(sec.title);
+      const secItems = Array.isArray(sec.items)
+        ? sec.items.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+      for (const item of secItems) {
+        appendSectionItem(sections, title, item);
+      }
+    }
+  }
+  if (!sections.length && fallbackItems.length) {
+    sections.push({ title: "", items: [...fallbackItems] });
+  }
+  return sections;
+}
+
+function parseNotesSections(notes) {
+  const bulletSections = [];
+  const plainSections = [];
+  let currentSection = "";
   let inCodeFence = false;
   for (const rawLine of String(notes || "").split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -152,17 +241,31 @@ function parseNotesItems(notes) {
       inCodeFence = !inCodeFence;
       continue;
     }
-    if (inCodeFence || !line || line.startsWith("#") || line.startsWith(">")) {
+    if (inCodeFence || !line || line.startsWith(">")) {
+      continue;
+    }
+    if (line.startsWith("### ")) {
+      if (INSTALL_SECTION_RE.test(line)) {
+        break;
+      }
+      currentSection = normalizeSectionTitle(line.slice(4));
+      continue;
+    }
+    if (line.startsWith("#")) {
       continue;
     }
     if (/^[-*•]\s+/.test(line)) {
       const cleaned = line.replace(/^[-*•]\s+/, "").trim();
-      if (cleaned) bullets.push(cleaned);
+      if (cleaned) appendSectionItem(bulletSections, currentSection, cleaned);
     } else {
-      plain.push(line);
+      appendSectionItem(plainSections, currentSection, line);
     }
   }
-  return bullets.length ? bullets : plain;
+  return bulletSections.length ? bulletSections : plainSections;
+}
+
+function parseNotesItems(notes) {
+  return parseNotesSections(notes).flatMap((sec) => sec.items);
 }
 
 function describeCannotSelfUpdate(reason) {
@@ -188,23 +291,40 @@ function safeOpenExternalUrl(rawUrl) {
 
 function buildCombinedChangelogEntries(info) {
   const entries = (state.changelogEntries || [])
-    .map((e) => ({
-      version: normalizeVersion(e.version),
-      date: e.date || "",
-      items: Array.isArray(e.items) ? [...e.items] : [],
-      next: false,
-    }))
+    .map((e) => {
+      const items = Array.isArray(e.items)
+        ? e.items.map((x) => String(x || "").trim()).filter(Boolean)
+        : [];
+      const sections = normalizeEntrySections(e.sections, items);
+      return {
+        version: normalizeVersion(e.version),
+        date: e.date || "",
+        items: items.length ? items : sections.flatMap((sec) => sec.items),
+        sections,
+        next: false,
+      };
+    })
     .filter((e) => e.version);
 
   const upsertEntry = (version, date, notes, { markNext = false } = {}) => {
     const cleanVer = normalizeVersion(version);
     if (!cleanVer) return;
-    const parsedItems = notes ? parseNotesItems(notes) : [];
+    const parsedSections = notes ? parseNotesSections(notes) : [];
+    const parsedItems = parsedSections.flatMap((sec) => sec.items);
     const formattedDate = formatReleaseDate(date);
     const existing = entries.find((e) => compareSemver(e.version, cleanVer) === 0);
     if (existing) {
       if (markNext) existing.next = true;
-      if (!existing.items.length && parsedItems.length) existing.items = parsedItems;
+      if (!existing.items.length && parsedItems.length) {
+        existing.items = parsedItems;
+        existing.sections = parsedSections;
+      } else if (
+        parsedSections.some((sec) => sec.title) &&
+        !existing.sections.some((sec) => sec.title) &&
+        parsedItems.length === existing.items.length
+      ) {
+        existing.sections = parsedSections;
+      }
       if (!existing.date && formattedDate) existing.date = formattedDate;
       return;
     }
@@ -213,6 +333,7 @@ function buildCombinedChangelogEntries(info) {
         version: cleanVer,
         date: formattedDate,
         items: parsedItems,
+        sections: parsedSections,
         next: markNext,
       });
     }
@@ -676,13 +797,44 @@ function renderChangelogList(info, currentVer) {
         tags.push(`<span class="update-changelog-tag">升级前版本</span>`);
       }
 
-      const itemsHtml = (entry.items || [])
-        .map(
-          (item) => `
+      const sections = normalizeEntrySections(entry.sections, entry.items || []).filter(
+        (sec) => sec.items.length
+      );
+      const hasTitledSection = sections.some((sec) => Boolean(sec.title));
+
+      let bodyHtml = "";
+      if (hasTitledSection) {
+        bodyHtml = `<div class="update-changelog-groups">${sections
+          .map((sec) => {
+            const kindClass = sectionKindClass(sec.title);
+            const headingHtml = sec.title
+              ? `<div class="update-changelog-group-head"><span class="update-changelog-kind ${kindClass}">${escapeHtml(sec.title)}</span></div>`
+              : "";
+            const itemsHtml = sec.items
+              .map(
+                (item) => `
+              <li class="update-changelog-item">${formatInlineMarkdown(item)}</li>
+            `
+              )
+              .join("");
+            return `
+              <div class="update-changelog-group">
+                ${headingHtml}
+                <ul class="update-changelog-items">${itemsHtml}</ul>
+              </div>
+            `;
+          })
+          .join("")}</div>`;
+      } else {
+        const itemsHtml = (entry.items || [])
+          .map(
+            (item) => `
           <li class="update-changelog-item">${formatInlineMarkdown(item)}</li>
         `
-        )
-        .join("");
+          )
+          .join("");
+        bodyHtml = itemsHtml ? `<ul class="update-changelog-items">${itemsHtml}</ul>` : "";
+      }
 
       return `
         <section class="update-changelog-entry">
@@ -691,7 +843,7 @@ function renderChangelogList(info, currentVer) {
             ${tags.join("")}
             ${entry.date ? `<span class="update-changelog-date">${escapeHtml(entry.date)}</span>` : ""}
           </div>
-          ${itemsHtml ? `<ul class="update-changelog-items">${itemsHtml}</ul>` : ""}
+          ${bodyHtml}
         </section>
       `;
     })
